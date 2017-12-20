@@ -30,8 +30,15 @@
 #ifndef WIZFI310_MISC_TIMEOUT
 #define WIZFI310_MISC_TIMEOUT    500
 #endif
-#ifndef WIZFI310_OPEN_CLOSE_TIMEOUT
-#define WIZFI310_OPEN_CLOSE_TIMEOUT    10000
+#ifndef WIZFI310_OPEN_TIMEOUT
+#define WIZFI310_OPEN_TIMEOUT   10000
+#endif
+#ifndef WIZFI310_CLOSE_TIMEOUT
+#define WIZFI310_CLOSE_TIMEOUT   500
+#endif
+
+#ifndef WIZFI310_MAX_CONNECT_COUNT
+#define WIZFI310_MAX_CONNECT    2
 #endif
 
 #ifndef WIZFI310_DELAY_MS
@@ -63,6 +70,7 @@ int WizFi310Interface::connect(const char *ssid, const char *pass, nsapi_securit
 int WizFi310Interface::connect()
 {
     char sec[10];
+    int i;
 
     _wizfi310.setTimeout(WIZFI310_CONNECT_TIMEOUT);
 
@@ -71,6 +79,11 @@ int WizFi310Interface::connect()
     if( !_wizfi310.dhcp(true) )
     {
         return NSAPI_ERROR_DHCP_FAILURE;
+    }
+
+    if( ap_sec == NSAPI_SECURITY_NONE && (strlen(sec) > 0) )
+    {
+        ap_sec = NSAPI_SECURITY_UNKNOWN;
     }
 
     switch( ap_sec )
@@ -95,8 +108,16 @@ int WizFi310Interface::connect()
             break;
     }
 
-    if( !(_wizfi310.connect(ap_ssid, ap_pass, sec)) )
+    for( i=0; i<WIZFI310_MAX_CONNECT; i++ )
     {
+        if( _wizfi310.connect(ap_ssid, ap_pass, sec) ) {
+            break;
+        }
+
+        _wizfi310.reset();
+    }
+
+    if( i > WIZFI310_MAX_CONNECT ){
         return NSAPI_ERROR_NO_CONNECTION;
     }
 
@@ -224,7 +245,7 @@ int WizFi310Interface::socket_close(void *handle)
 {
     struct wizfi310_socket *socket = (struct wizfi310_socket *)handle;
     int err = 0;
-    _wizfi310.setTimeout(WIZFI310_OPEN_CLOSE_TIMEOUT);
+    _wizfi310.setTimeout(WIZFI310_CLOSE_TIMEOUT);
 
     if (socket->connected && !_wizfi310.close(socket->id)) {
         err = NSAPI_ERROR_DEVICE_ERROR;
@@ -249,7 +270,7 @@ int WizFi310Interface::socket_listen(void *handle, int backlog)
 int WizFi310Interface::socket_connect(void *handle, const SocketAddress &addr)
 {
     struct wizfi310_socket *socket = (struct wizfi310_socket *)handle;
-    _wizfi310.setTimeout(WIZFI310_OPEN_CLOSE_TIMEOUT);
+    _wizfi310.setTimeout(WIZFI310_OPEN_TIMEOUT);
 
     const char *proto = (socket->proto == NSAPI_UDP) ? "UCN" : "TCN";
     if (!_wizfi310.open(proto, socket->id, addr.get_ip_address(), addr.get_port())) {

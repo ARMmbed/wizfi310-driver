@@ -15,17 +15,38 @@
  */
 
 #include "WizFi310.h"
-#define WIZFI310_DEFAULT_BAUD_RATE    115200
+#define WIZFI310_DEFAULT_BAUD_RATE      9600
+
+#define AT_CMD_PARSER_DEFAULT_TIMEOUT   500
+#define AT_CMD_PARSER_RECV_TIMEOUT      20000
 
 WizFi310::WizFi310(PinName tx, PinName rx, bool debug)
     : _serial(tx, rx, WIZFI310_DEFAULT_BAUD_RATE),
-      _parser(&_serial),
+      _parser(&_serial,"\r",512),
       _packets(0),
       _packets_end(&_packets)
 {
+ //   int i;
+
     _serial.set_baud( WIZFI310_DEFAULT_BAUD_RATE );
     _parser.debug_on(debug);
     _parser.set_delimiter("\r");
+    /*
+    if( !(_parser.send("AT") && _parser.recv("[OK]")) ) {
+        _serial.set_baud( WIZFI310_SECOND_BAUD_RATE );
+        
+        for(i=0;i<2;i++){
+            if( _parser.send("AT") && _parser.recv("[OK]") ) {
+                break;
+            }
+        }
+
+        if( _parser.send("AT+USET=9600") && _parser.recv("[OK]") )
+        {
+            _serial.set_baud( WIZFI310_DEFAULT_BAUD_RATE );
+        }
+    }
+    */
 
     //_parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version);
     for(int i=0; i<10; i++)
@@ -66,6 +87,7 @@ bool WizFi310::startup(int mode)
     _op_mode = mode;
 
     _parser.oob("{", callback(this, &WizFi310::_packet_handler));
+    _parser.oob("\n{", callback(this, &WizFi310::_packet_handler));
     return true;
 }
 
@@ -248,13 +270,14 @@ bool WizFi310::send(int id, const void *data, uint32_t amount)
         return false;
     }
 
+    //_parser.flush();
     sprintf(str_result,"[%d,,,%d]",id,(int)amount);
 
     for (unsigned i=0; i<2; i++) {
         if( _parser.send("AT+SSEND=%d,,,%d",id, (int)amount)
          && _parser.recv(str_result)
          && _parser.write((char*)data, (int)amount) >= 0
-         && _parser.recv("[OK]") ){
+         && _parser.recv("[OK]\r\n") ){
             return true;
         }
     }
@@ -273,6 +296,8 @@ void WizFi310::_packet_handler()
         return;
     }
 
+    // original
+    /*
     struct packet *packet = (struct packet*)malloc(
             sizeof(struct packet) + amount);
     if (!packet) {
@@ -283,10 +308,33 @@ void WizFi310::_packet_handler()
     packet->len = amount;
     packet->next = 0;
 
+    setTimeout(AT_CMD_PARSER_RECV_TIMEOUT);
     if (!(_parser.read((char*)(packet + 1), amount))) {
         free(packet);
         return;
     }
+    setTimeout(AT_CMD_PARSER_DEFAULT_TIMEOUT);
+    */
+
+    // kaizen
+    struct packet *packet = new struct packet;
+    if (!packet) {
+        return;
+    }
+
+    packet->id = id;
+    packet->len = amount;
+    packet->next = 0;
+    packet->data = (char*)malloc(amount);
+
+    
+    setTimeout(AT_CMD_PARSER_RECV_TIMEOUT);
+    if (!(_parser.read((char*)packet->data, amount))) {
+        free(packet);
+        return;
+    }
+    _parser.recv("\n");
+    setTimeout(AT_CMD_PARSER_DEFAULT_TIMEOUT);
 
     *_packets_end = packet;
     _packets_end = &packet->next;
@@ -301,7 +349,8 @@ int32_t WizFi310::recv(int id, void *data, uint32_t amount)
                 struct packet *q = *p;
                 
                 if (q->len <= amount) {
-                    memcpy(data, q+1, q->len);
+                    //memcpy(data, q+1, q->len);    // original
+                    memcpy(data,q->data, q->len);   // kaizen
 
                     if (_packets_end == &(*p)->next) {
                         _packets_end = p;
@@ -312,10 +361,12 @@ int32_t WizFi310::recv(int id, void *data, uint32_t amount)
                     free(q);
                     return len;
                 } else { // return only partial packet
-                    memcpy(data, q+1, amount);
+                    //memcpy(data, q+1, amount);
+                    memcpy(data, q->data, amount);
                     
                     q->len -= amount;
-                    memmove(q+1, (uint8_t*)(q+1) + amount, q->len);
+                    //memmove(q+1, (uint8_t*)(q+1) + amount, q->len);
+                    memmove(q->data, (uint8_t*)(q->data) + amount, q->len);
                     return amount;
                 }
             }
@@ -336,7 +387,6 @@ bool WizFi310::close(int id)
         return false;
     }
 
-    sprintf(sock_event_msg,"[DISCONNECT %d]",id);
     if (_parser.send("AT+SMGMT=%d", id) && _parser.recv(sock_event_msg) && _parser.recv("[OK]") )
     {
         return true;
