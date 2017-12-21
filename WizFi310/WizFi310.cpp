@@ -22,7 +22,7 @@
 
 WizFi310::WizFi310(PinName tx, PinName rx, bool debug)
     : _serial(tx, rx, WIZFI310_DEFAULT_BAUD_RATE),
-      _parser(&_serial,"\r",512),
+      _parser(&_serial),
       _packets(0),
       _packets_end(&_packets)
 {
@@ -30,7 +30,7 @@ WizFi310::WizFi310(PinName tx, PinName rx, bool debug)
 
     _serial.set_baud( WIZFI310_DEFAULT_BAUD_RATE );
     _parser.debug_on(debug);
-    _parser.set_delimiter("\r");
+    _parser.set_delimiter("\r\n");
     /*
     if( !(_parser.send("AT") && _parser.recv("[OK]")) ) {
         _serial.set_baud( WIZFI310_SECOND_BAUD_RATE );
@@ -87,7 +87,7 @@ bool WizFi310::startup(int mode)
     _op_mode = mode;
 
     _parser.oob("{", callback(this, &WizFi310::_packet_handler));
-    _parser.oob("\n{", callback(this, &WizFi310::_packet_handler));
+    //_parser.oob("\n{", callback(this, &WizFi310::_packet_handler));
     return true;
 }
 
@@ -270,17 +270,16 @@ bool WizFi310::send(int id, const void *data, uint32_t amount)
         return false;
     }
 
-    //_parser.flush();
     sprintf(str_result,"[%d,,,%d]",id,(int)amount);
-
-    for (unsigned i=0; i<2; i++) {
-        if( _parser.send("AT+SSEND=%d,,,%d",id, (int)amount)
-         && _parser.recv(str_result)
-         && _parser.write((char*)data, (int)amount) >= 0
-         && _parser.recv("[OK]\r\n") ){
-            return true;
-        }
+    
+    // Using _parser.printf because MCU can't send CR LF
+    if( _parser.printf("AT+SSEND=%d,,,%d\r",id, (int)amount)
+     && _parser.recv(str_result)
+     && _parser.write((char*)data, (int)amount) >= 0
+     && _parser.recv("[OK]") ){
+        return true;
     }
+
     return false;
 }
 
@@ -333,8 +332,7 @@ void WizFi310::_packet_handler()
         free(packet);
         return;
     }
-    _parser.recv("\n");
-    setTimeout(AT_CMD_PARSER_DEFAULT_TIMEOUT);
+    setTimeout(_timeout_ms);
 
     *_packets_end = packet;
     _packets_end = &packet->next;
@@ -398,6 +396,7 @@ bool WizFi310::close(int id)
 void WizFi310::setTimeout(uint32_t timeout_ms)
 {
     _parser.set_timeout(timeout_ms);
+    _timeout_ms = timeout_ms;
 }
 
 bool WizFi310::readable()

@@ -216,6 +216,7 @@ private:
 
     int  _op_mode;      // 0 : Station Mode, 1 : AP Mode
     bool _dhcp;
+    uint32_t _timeout_ms;
 };
 
 #endif
