@@ -81,7 +81,7 @@ int WizFi310Interface::connect()
         return NSAPI_ERROR_DHCP_FAILURE;
     }
 
-    if( ap_sec == NSAPI_SECURITY_NONE && (strlen(sec) > 0) )
+    if( ap_sec == NSAPI_SECURITY_NONE && (strlen(ap_pass) > 0) )
     {
         ap_sec = NSAPI_SECURITY_UNKNOWN;
     }
