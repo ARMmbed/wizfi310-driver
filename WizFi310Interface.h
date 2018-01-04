@@ -37,10 +37,6 @@ public:
      */
 
     WizFi310Interface(PinName tx, PinName rx, bool debug = false);
-    //WizFi310Interface(PinName tx, PinName rx, 
-    //        PinName rts = WIZFI310_RTS_PIN, PinName cts = WIZFI310_CTS_PIN, 
-    //        PinName reset = WIZFI310_RESET_PIN, PinName alarm = WIZFI310_ALARM_PIN,
-    //        int baud=115200 );
 
     /** Start the interface
      *
@@ -124,7 +120,6 @@ public:
      *
      * @param  ap       Pointer to allocated array to store discovered AP
      * @param  count    Size of allocated @a res array, or 0 to only count available AP
-     * @param  timeout  Timeout in milliseconds; 0 for no timeout (Default: 0)
      * @return          Number of entries in @a, or if @a count was 0 number of available networks, negative on error
      *                  see @a nsapi_error
      */
