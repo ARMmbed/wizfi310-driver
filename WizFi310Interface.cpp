@@ -165,6 +165,7 @@ int WizFi310Interface::set_credentials(const char *ssid, const char *pass, nsapi
 
 int WizFi310Interface::set_channel(uint8_t channel)
 {
+    return 0;
 }
 
 int WizFi310Interface::disconnect()
