@@ -41,11 +41,6 @@
 
 #define WIZFI310_SOCKET_COUNT 8
 
-#define WIZFI310_RTS_PIN   NC
-#define WIZFI310_CTS_PIN   NC
-#define WIZFI310_RESET_PIN NC
-#define WIZFI310_ALARM_PIN NC
-
 /** WizFi310Interface class
  *  Implementation of the NetworkStack for the WizFi310
  */
