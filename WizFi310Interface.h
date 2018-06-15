@@ -50,7 +50,9 @@ public:
     /* WizFi310Interface constructor
      */
 
-    WizFi310Interface(PinName tx, PinName rx, bool debug = false);
+    WizFi310Interface(PinName tx = MBED_CONF_WIZFI310_TX,
+                      PinName rx = MBED_CONF_WIZFI310_RX,
+                      bool debug = MBED_CONF_WIZFI310_DEBUG);
 
     /** Start the interface
      *
@@ -175,14 +177,14 @@ protected:
     /** Close the socket
      *  @param handle       Socket handle
      *  @return             0 on success, negative on failure
-     *  @note On failure, any memory associated with the socket must still 
+     *  @note On failure, any memory associated with the socket must still
      *        be cleaned up
      */
     virtual int socket_close(void *handle);
 
     /** Bind a server socket to a specific port
      *  @param handle       Socket handle
-     *  @param address      Local address to listen for incoming connections on 
+     *  @param address      Local address to listen for incoming connections on
      *  @return             0 on success, negative on failure.
      */
     virtual int socket_bind(void *handle, const SocketAddress &address);
@@ -275,7 +277,7 @@ protected:
 private:
     WizFi310 _wizfi310;
     bool _ids[WIZFI310_SOCKET_COUNT];
-    
+
     char ap_ssid[33]; /* 32 is what 802.11 defines as longest possible name; +1 for the \0 */
     nsapi_security_t ap_sec;
     uint8_t ap_ch;
