@@ -1,0 +1,18 @@
+{
+    "name": "wizfi310",
+    "config": {
+
+        "tx": {
+            "help": "TX pin for serial connection to external device (WizFi310)",
+            "value": "D1"
+        },
+        "rx": {
+            "help": "RX pin for serial connection to external device (WizFi310)",
+            "value": "D0"
+        },
+        "debug": {
+            "help": "Enable debug logs for (WizFi310)",
+            "value": false
+        }
+    }
+}
