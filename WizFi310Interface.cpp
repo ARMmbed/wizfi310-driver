@@ -66,8 +66,8 @@
 #endif
 
 // WizFi310Interface implementation
-WizFi310Interface::WizFi310Interface(PinName tx, PinName rx, bool debug)
-    : _wizfi310(tx, rx, debug)
+WizFi310Interface::WizFi310Interface(PinName tx, PinName rx, bool debug, PinName rts, PinName cts)
+    : _wizfi310(tx, rx, rts, cts, debug)
 {
     memset(_ids, 0, sizeof(_ids));
     memset(_cbs, 0, sizeof(_cbs));

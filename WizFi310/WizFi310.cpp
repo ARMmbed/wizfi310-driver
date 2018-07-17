@@ -40,8 +40,9 @@
 #define AT_CMD_PARSER_INIT_TIMEOUT       1000
 #define AT_CMD_PARSER_RECV_TIMEOUT      20000
 
-WizFi310::WizFi310(PinName tx, PinName rx, bool debug)
+WizFi310::WizFi310(PinName tx, PinName rx, PinName rts, PinName cts, bool debug)
     : _serial(tx, rx, WIZFI310_DEFAULT_BAUD_RATE),
+      _rts(rts), _cts(cts),
       _parser(&_serial),
       _packets(0),
       _packets_end(&_packets)
@@ -50,22 +51,8 @@ WizFi310::WizFi310(PinName tx, PinName rx, bool debug)
     _parser.debug_on(debug);
     _parser.set_delimiter("\r\n");
 
-    setTimeout(AT_CMD_PARSER_INIT_TIMEOUT);
-    for(int i=0; i<10; i++)
-    {
-        if( _parser.send("AT") && _parser.recv("[OK]") )
-        {
-            _parser.send("AT+MECHO=0");
-            _parser.recv("[OK]");
-            _parser.send("AT+MPROF=S");
-            _parser.recv("[OK]");
-            _parser.send("AT+MRESET");
-            _parser.recv("[OK]");
-            break;
-        }
-    }
-
-    _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version);
+    _parser.oob("{", callback(this, &WizFi310::_packet_handler));
+    //_parser.oob("\n{", callback(this, &WizFi310::_packet_handler));
 }
 
 const char* WizFi310::get_firmware_version()
@@ -92,8 +79,48 @@ bool WizFi310::startup(int mode)
     }
     _op_mode = mode;
 
-    _parser.oob("{", callback(this, &WizFi310::_packet_handler));
-    //_parser.oob("\n{", callback(this, &WizFi310::_packet_handler));
+    setTimeout(AT_CMD_PARSER_INIT_TIMEOUT);
+    for(int i=0; i<10; i++)
+    {
+        if( _parser.send("AT") && _parser.recv("[OK]") )
+        {
+            _parser.send("AT+MECHO=0");
+            _parser.recv("[OK]");
+            break;
+        }
+    }
+
+#if !DEVICE_SERIAL_FC
+    if( _parser.send("AT+USET=%d,N,8,1,N",WIZFI310_DEFAULT_BAUD_RATE)
+        && _parser.recv("[OK]")
+        && _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version) )
+    {
+        //debug_if(_dbg_on, "error disabling HW flow control\r\n");
+        return false;
+    }
+#else
+    if( (_rts != NC) && (_cts != NC) )
+    {
+        if( _parser.send("AT+USET=%d,N,8,1,HW",WIZFI310_DEFAULT_BAUD_RATE)
+            && _parser.recv("[OK]")
+            && _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version) )
+        {
+            //debug_if(_dbg_on, "error enabling HW flow control\r\n");
+            return false;
+        }
+    }
+    else
+    {
+        if( _parser.send("AT+USET=%d,N,8,1,N",WIZFI310_DEFAULT_BAUD_RATE)
+            && _parser.recv("[OK]")
+            && _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version) )
+        {
+            //debug_if(_dbg_on, "error disabling HW flow control\r\n");
+            return false;
+        }
+    }
+#endif //DEVICE_SERIAL_FC
+
     return true;
 }
 

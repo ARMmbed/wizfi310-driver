@@ -44,7 +44,7 @@
 class WizFi310
 {
 public:
-    WizFi310(PinName tx, PinName rx, bool debug=false);
+    WizFi310(PinName tx, PinName rx, PinName rts, PinName cts, bool debug=false);
 
     /**
     * Check firmware version of WizFi310
@@ -228,6 +228,9 @@ public:
 private:
     UARTSerial _serial;
     ATCmdParser _parser;
+
+    PinName _rts;
+    PinName _cts;
 
     struct packet {
         struct packet *next;
