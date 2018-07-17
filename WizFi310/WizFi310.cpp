@@ -353,40 +353,65 @@ void WizFi310::_packet_handler()
     _packets_end = &packet->next;
 }
 
-int32_t WizFi310::recv(int id, void *data, uint32_t amount)
+int32_t WizFi310::recv_tcp(int id, void *data, uint32_t amount)
 {
-	while (true) {
-		// check if any packets are ready for us
-        for (struct packet **p = &_packets; *p; p = &(*p)->next) {
-            if ((*p)->id == id) {
-                struct packet *q = *p;
-                
-                if (q->len <= amount) {
-                    memcpy(data,q->data, q->len);
+    while(_parser.process_oob()) {
+    }
 
-                    if (_packets_end == &(*p)->next) {
-                        _packets_end = p;
-                    }
-                    *p = (*p)->next;
+    for (struct packet **p = &_packets; *p; p = &(*p)->next) {
+        if ((*p)->id == id) {
+            struct packet *q = *p;
 
-                    uint32_t len = q->len;
-                    free(q);
-                    return len;
-                } else { // return only partial packet
-                    memcpy(data, q->data, amount);
-                    
-                    q->len -= amount;
-                    memmove(q->data, (uint8_t*)(q->data) + amount, q->len);
-                    return amount;
+            if (q->len <= amount) {
+                memcpy(data,q->data, q->len);
+
+                if (_packets_end == &(*p)->next) {
+                    _packets_end = p;
                 }
+                *p = (*p)->next;
+
+                uint32_t len = q->len;
+                free(q);
+                return len;
+            } else { // return only partial packet
+                memcpy(data, q->data, amount);
+
+                q->len -= amount;
+                memmove(q->data, (uint8_t*)(q->data) + amount, q->len);
+                return amount;
             }
         }
+    }
 
-        // check for inbound packets
-        if (!_parser.process_oob()) {
-            return -1;
+    return NSAPI_ERROR_WOULD_BLOCK;
+}
+
+int32_t WizFi310::recv_udp(int id, void *data, uint32_t amount)
+{
+    // Poll for inbound packets
+    while (_parser.process_oob()) {
+    }
+
+    // check if any packets are ready for us
+    for (struct packet **p = &_packets; *p; p = &(*p)->next) {
+        if ((*p)->id == id) {
+            struct packet *q = *p;
+
+            // Return and remove packet (truncated if necessary)
+            uint32_t len = q->len < amount ? q->len : amount;
+            memcpy(data, q->data, len);
+
+            if (_packets_end == &(*p)->next) {
+                _packets_end = p;
+            }
+            *p = (*p)->next;
+
+            free(q);
+            return len;
         }
     }
+
+    return NSAPI_ERROR_WOULD_BLOCK;
 }
 
 bool WizFi310::close(int id)
