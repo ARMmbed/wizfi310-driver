@@ -40,6 +40,7 @@
 #define AT_CMD_PARSER_INIT_TIMEOUT       1000
 #define AT_CMD_PARSER_RECV_TIMEOUT      20000
 
+using namespace mbed;
 WizFi310::WizFi310(PinName tx, PinName rx, bool debug)
     : _serial(tx, rx, WIZFI310_DEFAULT_BAUD_RATE),
       _parser(&_serial),

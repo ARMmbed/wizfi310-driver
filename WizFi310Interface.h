@@ -36,6 +36,7 @@
 #ifndef WIZFI310_INTERFACE_H
 #define WIZFI310_INTERFACE_H
 
+#include "NetworkStack.h"
 #include "WiFiInterface.h"
 #include "WizFi310.h"
 
