@@ -37,6 +37,8 @@
 #define WIZFI310_H_
 
 #include "ATCmdParser.h"
+#include "netsocket/WiFiAccessPoint.h"
+#include "UARTSerial.h"
 #include "nsapi_types.h"
 #include "rtos.h"
 
@@ -224,7 +226,7 @@ public:
     *
     * @param func A pointer to a void function, or 0 to set as none
     */
-    void attach(Callback<void()> func);
+    void attach(mbed::Callback<void()> func);
 
     /**
     * Attach a function to call whenever network state has changed
@@ -234,12 +236,12 @@ public:
     */
     template <typename T, typename M>
     void attach(T *obj, M method) {
-        attach(Callback<void()>(obj, method));
+        attach(mbed::Callback<void()>(obj, method));
     }
 
 private:
-    UARTSerial _serial;
-    ATCmdParser _parser;
+    mbed::UARTSerial _serial;
+    mbed::ATCmdParser _parser;
 
     PinName _rts;
     PinName _cts;

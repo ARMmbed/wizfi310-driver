@@ -37,6 +37,7 @@
 #include "WizFi310Interface.h"
 #include "mbed_debug.h"
 
+using namespace mbed;
 // Various timeouts for different WizFi310 operations
 #ifndef WIZFI310_CONNECT_TIMEOUT
 #define WIZFI310_CONNECT_TIMEOUT 15000
