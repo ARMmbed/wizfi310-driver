@@ -305,19 +305,13 @@ void WizFi310::_packet_handler()
         return;
     }
 
-    struct packet *packet = new struct packet;
+    struct packet *packet = new struct packet(id, amount);
     if (!packet) {
         return;
     }
 
-    packet->id = id;
-    packet->len = amount;
-    packet->next = 0;
-    packet->data = (char*)malloc(amount);
-
-    
     if (!(_parser.read((char*)packet->data, amount))) {
-        free(packet);
+        delete(packet);
         setTimeout(_timeout_ms);
         return;
     }
@@ -344,7 +338,7 @@ int32_t WizFi310::recv(int id, void *data, uint32_t amount)
                     *p = (*p)->next;
 
                     uint32_t len = q->len;
-                    free(q);
+                    delete(q);
                     return len;
                 } else { // return only partial packet
                     memcpy(data, q->data, amount);
