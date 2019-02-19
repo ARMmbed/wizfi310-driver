@@ -13,6 +13,10 @@
         "debug": {
             "help": "Enable debug logs for (WizFi310)",
             "value": false
+        },
+        "provide-default": {
+            "help": "Provide default WifiInterface. [true/false]",
+            "value": false
         }
     }
 }

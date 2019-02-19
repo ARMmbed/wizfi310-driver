@@ -383,3 +383,12 @@ void WizFi310Interface::event()
         }
     }
 }
+
+#if MBED_CONF_WIZFI310_PROVIDE_DEFAULT
+
+WiFiInterface *WiFiInterface::get_default_instance() {
+    static WizFi310Interface wizfi(MBED_CONF_WIZFI310_TX, MBED_CONF_WIZFI310_RX, MBED_CONF_WIZFI310_DEBUG);
+    return &wizfi;
+}
+
+#endif
