@@ -1,4 +1,4 @@
-/* 
+/*
  * Copyright (c) 2015 ARM Limited
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,474 +33,1006 @@
   ******************************************************************************
   */
 
+/*
+ * Notes:
+ *  Assumptions:
+ *  - command terminations are "[OK]" or "[ERROR%[^\]]]" .
+ *
+ *  Notes:
+ *  - reception notification may arrive at anytime even in the middle of a response such as wstatus report.
+ *
+ *  Strategies:
+ *  - All reads to the serial line are done in the event queue thread context
+ *  - All callbacks are invoked from the event queue thread context.
+ *  - A limit is set to the amount of received payload.
+ *  - If hardware flow control (hwfc) is present, any further reception/command will be paused until the buffer gets read.
+ *  - If no hwfc is available, the affected socket gets closed and the incomming packets are ignored/dropped.
+ *
+ *  Failure handling :
+ *  - If a command times out, the module is considered out of sync and operations are stopped until next module reset.
+ *  - If an unrecognized sequence of characters is received the driver stops all operation until
+ *    a reset is operated. This is to prevent any risk of received data being interpreted as being module's response when it is not.
+ *
+ * Known issues :
+ * - Ideally the reset should be hardware as detection through the greeting message may be spooffed by malicious incoming data.
+ * - Because the module may send a reception event at anytime (even in the middle of a reception) if an SSID or some other
+ *   user/envirenmentaly controled input contains something similar to the recv header, it may open gate to malicious packet
+ *   injection.
+ *
+ * Author: Wilfried Chauveau
+ */
+
+/**
+ * @TODO:
+ * - [ ] analyze event queue usage and adjust its default size.
+ * - [ ] analyze dispatch thread usage and adjust its default stack size.
+ * - [ ] overhaul the event_serial & recv_state_update functions
+ * - [ ] review error detection & handling & make sure all case are covered.
+ * - [ ] complete doxygenation
+ * - [ ] add support for non-dhcp/static ip mode
+ * - [ ] add support for listen socket
+ * - [ ] add support for thread safe ip/rssi/gateway reading
+ */
+
+#include "mbed.h"
+#include "mbed_trace.h"
 #include "WizFi310.h"
-#define WIZFI310_DEFAULT_BAUD_RATE      115200
+#include "DigitalOut.h"
+
+#define TRACE_GROUP                     "WZFI"
+
+#define WIZFI310_DEFAULT_BAUD_RATE     115200
 
 #define AT_CMD_PARSER_DEFAULT_TIMEOUT     500
 #define AT_CMD_PARSER_INIT_TIMEOUT       1000
 #define AT_CMD_PARSER_RECV_TIMEOUT      20000
 
 using namespace mbed;
-WizFi310::WizFi310(PinName tx, PinName rx, bool debug)
-    : _serial(tx, rx, WIZFI310_DEFAULT_BAUD_RATE),
-      _parser(&_serial),
-      _packets(0),
-      _packets_end(&_packets)
+
+// =================================================================================================
+// Utility functions
+static void consume(uint8_t *to, uint8_t *from, volatile uint32_t &from_len, uint32_t amount)
 {
-    _serial.set_baud( WIZFI310_DEFAULT_BAUD_RATE );
-    _parser.debug_on(debug);
-    _parser.set_delimiter("\r\n");
-
-    setTimeout(AT_CMD_PARSER_INIT_TIMEOUT);
-    for(int i=0; i<10; i++)
-    {
-        if( _parser.send("AT") && _parser.recv("[OK]") )
-        {
-            _parser.send("AT+MECHO=0");
-            _parser.recv("[OK]");
-            _parser.send("AT+MPROF=S");
-            _parser.recv("[OK]");
-            _parser.send("AT+MRESET");
-            _parser.recv("[OK]");
-            break;
-        }
-    }
-
-    _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version);
+    memcpy(to, from, amount);
+    from_len -= amount;
+    memmove(from, from + amount, from_len);
 }
 
-const char* WizFi310::get_firmware_version()
+// =================================================================================================
+// Driver implementation
+WizFi310::WizFi310(PinName tx, PinName rx, PinName rts, PinName cts, PinName rst) :
+    m_rst(rst), m_rts(rts), m_cts(cts), m_nrst_pin(rst, 0),
+    m_serial(tx, rx, WIZFI310_DEFAULT_BAUD_RATE),
+    m_attached(false),
+    m_has_hwfc((rts != NC) && (cts != NC)),
+    m_rx_event_id(0), m_isr_buf_len(0), m_line_buf_len(0),
+    m_active_action(ActionBlocked),
+    m_greetings_cbk(NULL), m_on_cmd_end(NULL),
+    m_recv_state(Unknown),
+    m_data_to_receive(0), m_pending_packet(NULL), m_pending_socket(NULL), m_heap_used(0),
+    m_thread(osPriorityNormal, MBED_CONF_WIZFI310_STACKSIZE, NULL, "wizfi310_driver"),
+    m_event_queue(MBED_CONF_WIZFI310_EVENT_QUEUE_SIZE),
+    m_connection_status(NSAPI_STATUS_DISCONNECTED),
+    m_dhcp(true)
 {
-    if( strlen(_firmware_version) != 0 )
-    {
-        return _firmware_version;
+    if (rst != NC) {
+        m_nrst_pin = 0; // force reset on instanciation to match the default states.
     }
 
-    _parser.send("AT+MINFO");
-    if( _parser.recv("%s/WizFi310 Rev", _firmware_version) )
-    {
-        return _firmware_version;
-    }
-
-    return 0;
+    m_thread.start(Callback<void()>(&m_event_queue, &EventQueue::dispatch_forever));
+    m_event_queue.call_every(2000, this, &WizFi310::heart_beat);
 }
 
-bool WizFi310::startup(int mode)
+WizFi310::~WizFi310()
 {
-    if( mode != 0 && mode != 1 )
-    {
-        return false;
-    }
-    _op_mode = mode;
-
-    _parser.oob("{", callback(this, &WizFi310::_packet_handler));
-    //_parser.oob("\n{", callback(this, &WizFi310::_packet_handler));
-    return true;
+    // TODO: we may want to gracefully shut down sockets
+    // we may also want to gracefully disconnect the device and activate the
+    // hw reset if any was provided.
+    m_event_queue.break_dispatch();
+    m_thread.join();
 }
 
-bool WizFi310::reset(void)
+void WizFi310::attach(Callback<void(nsapi_connection_status_t)> status_change_cb)
 {
-    for (int i=0; i<2; i++)
-    {
-        if(_parser.send("AT+MRESET")
-           && _parser.recv("[OK]"))
-        {
-            return true;
-        }
-    }
-
-    return false;
+    m_on_status_change = status_change_cb;
 }
 
 bool WizFi310::dhcp(bool enabled)
 {
-    _dhcp = enabled;
-    return _dhcp;
+    // We should probably not accept a true here if the other parameters are not set.
+    m_dhcp = enabled;
+    return m_dhcp;
 }
 
-bool WizFi310::connect(const char *ap, const char *passPhrase, const char *sec)
+nsapi_error_t WizFi310::scan(Callback<void(nsapi_wifi_ap_t *)> ap_cb)
 {
-   if ( !(_parser.send("AT+WSET=0,%s", ap) && _parser.recv("[OK]")) )
-   {
-       return false;
-   }
-
-   //if ( !(_parser.send("AT+WSEC=0,%s,%s", sec, passPhrase) && _parser.recv("[OK]")) )
-   if ( !(_parser.send("AT+WSEC=0,,%s", passPhrase) && _parser.recv("[OK]")) )
-   {
-       return false;
-   }
-
-   if (_dhcp)
-   {
-       if ( !(_parser.send("AT+WNET=1") && _parser.recv("[OK]")) )
-       {
-           return false;
-       }
-   }
-   else
-   {
-       if ( !(_parser.send("AT+WNET=0,%s,%s,%s",_ip_buffer,_netmask_buffer,_gateway_buffer)
-             && _parser.recv("[OK]")) )
-       {
-           return false;
-       }
-   }
-
-   if ( !(_parser.send("AT+WJOIN") && _parser.recv("[Link-Up Event]")
-       && _parser.recv("  IP Addr    : %[^\n]\r\n",_ip_buffer)
-       && _parser.recv("  Gateway    : %[^\n]\r\n",_gateway_buffer)
-       && _parser.recv("[OK]")) )
-   {
-        return false;
-   }
-
-   return true;
-}
-
-bool WizFi310::disconnect(void)
-{
-    return _parser.send("AT+WLEAVE") && _parser.recv("[OK]");
-}
-
-const char *WizFi310::getIPAddress(void)
-{
-    if (!(_parser.send("AT+WSTATUS") && _parser.recv("IF/SSID/IP-Addr/Gateway/MAC/TxPower(dBm)/RSSI(-dBm)")
-         && _parser.recv("%*[^/]/%*[^/]/%15[^/]/",_ip_buffer)
-         && _parser.recv("[OK]")) )
-    {
-        return 0;
+    core_util_critical_section_enter();
+    action_t action = (action_t)m_active_action;
+    if ((action == ActionNone) || (action == ActionBlocked)) {
+        m_active_action = ActionDoScan;
+        core_util_critical_section_exit();
+    } else {
+        core_util_critical_section_exit();
+        return NSAPI_ERROR_WOULD_BLOCK;
     }
 
-    return _ip_buffer;
-}
+    m_scan_ap_cbk = ap_cb;
 
-const char *WizFi310::getMACAddress(void)
-{
-    if (!(_parser.send("AT+MMAC=?")
-        && _parser.recv("%[^\n]\r\n",_mac_buffer)
-        && _parser.recv("[OK]"))) {
-        return 0;
+    if (action == ActionBlocked) {
+        m_event_queue.call(this, &WizFi310::do_reset);
+    } else {
+        m_event_queue.call(this, &WizFi310::do_scan);
     }
 
-    return _mac_buffer;
+    return NSAPI_ERROR_IN_PROGRESS;
 }
 
-const char *WizFi310::getGateway()
+nsapi_error_t WizFi310::connect(const char *ap, const char *passPhrase, const char *sec)
 {
-   return _gateway_buffer; 
-}
+    tr_info("%s|%s setting credentials: (%s) \"%s\":\"%s\"", recv_state2str(m_recv_state), action2str((action_t)m_active_action), sec, ap, passPhrase);
 
-const char *WizFi310::getNetmask()
-{
-    return _netmask_buffer;
-}
-
-int8_t WizFi310::getRSSI()
-{
-    char rssi[3];
-
-    if (!(_parser.send("AT+WSTATUS") && _parser.recv("IF/SSID/IP-Addr/Gateway/MAC/TxPower(dBm)/RSSI(-dBm)")
-         //&& _parser.recv("%*[^/]/%*[^/]/%*[^/]/%*[^/]/%*[^/]/%*[^/]/%[^\n]\r\n",&rssi)
-         && _parser.recv("%*[^/]/%*[^/]/%*[^/]/%*[^/]/%*[^/]//%[^\n]\r\n",rssi)
-         && _parser.recv("[OK]")) )
-    {
-        return 0;
+    if ((ap == NULL) || (strlen(ap) == 0)) {
+        return NSAPI_ERROR_NO_SSID;
     }
 
-    return atoi(rssi);
-}
-
-bool WizFi310::isConnected(void)
-{
-    return getIPAddress() != 0;
-}
-
-int WizFi310::scan(WiFiAccessPoint *res, unsigned limit)
-{
-    unsigned int cnt = 0;
-    nsapi_wifi_ap_t ap;
-
-    // Scan Time out : 50ms
-    if (!(_parser.send("AT+WSCAN=,,,50")
-        && _parser.recv("Index/SSID/BSSID/RSSI(-dBm)/MaxDataRate(Mbps)/Security/RadioBand(GHz)/Channel")))
-    {
-        return NSAPI_ERROR_DEVICE_ERROR;
+    if (m_connection_status == NSAPI_STATUS_GLOBAL_UP) {
+        return NSAPI_ERROR_OK;
     }
-    
-    while (recv_ap(&ap)) {
-        if (cnt < limit)
-        {
-            res[cnt] = WiFiAccessPoint(ap);
-        }
-        cnt++;
-        if (limit != 0 && cnt >= limit)
-        {
+
+    core_util_critical_section_enter();
+    action_t action = (action_t)m_active_action;
+    if ((action != ActionNone) && (action != ActionBlocked)) {
+        core_util_critical_section_exit();
+        return NSAPI_ERROR_WOULD_BLOCK;
+    }
+    m_active_action = ActionDoConnect;
+    core_util_critical_section_exit();
+
+    this->set_connection_status(NSAPI_STATUS_CONNECTING);
+
+    m_cmd_ctx.connect.ap = ap;
+    m_cmd_ctx.connect.pw = passPhrase;
+    m_cmd_ctx.connect.sec = sec;
+    m_cmd_ctx.connect.attempt = 0;
+
+    if (action == ActionBlocked) {
+        m_event_queue.call(this, &WizFi310::do_reset);
+    } else {
+        m_event_queue.call(this, &WizFi310::do_set_access_point);
+    }
+    // TODO: Do we want a time out there ?
+    return NSAPI_ERROR_IN_PROGRESS;
+}
+
+nsapi_error_t WizFi310::disconnect()
+{
+    if (m_connection_status == NSAPI_STATUS_DISCONNECTED) {
+        return NSAPI_ERROR_NO_CONNECTION;
+    }
+    uint32_t expected_current = ActionNone;
+    if (!core_util_atomic_cas_u32(&m_active_action, &expected_current, ActionDoDisconnect)) {
+        return NSAPI_ERROR_WOULD_BLOCK;
+    }
+
+    m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::leave_done);
+    this->process_cmd("AT+WLEAVE\r");
+    return NSAPI_ERROR_IN_PROGRESS;
+}
+
+int WizFi310::open(const char *type, const char *addr, int port, Callback<void(void *, socket_event_t, socket_event_data_t &)> callback, void *data)
+{
+    uint32_t expected = ActionNone;
+    tr_debug("::open(%s, %s, %d){%s|%s}", type, addr, port, recv_state2str(m_recv_state), action2str((action_t)m_active_action));
+    if (!core_util_atomic_cas_u32(&m_active_action, &expected, ActionDoSOpen)) {
+        return NSAPI_ERROR_WOULD_BLOCK;
+    }
+
+    // try to guess the id used.
+    int id = 0;
+    socket_t *s = NULL;
+    for (; id < WIZFI310_SOCKET_COUNT; id++) {
+        s = &m_sockets[id];
+        if (s->status == socket_t::StatusDisconnected) {
             break;
         }
     }
+    if (id < WIZFI310_SOCKET_COUNT) {
+        s->mutex.lock();
+        s->reset();
+        s->status = socket_t::StatusConnecting;
+        s->cbk = callback;
+        s->data = data;
+        s->mutex.unlock();
 
-    return cnt;
+        m_cmd_ctx.sopen.s = s;
+        m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::sopen_done);
+        this->process_cmd("AT+SCON=O,%s,%s,%d,,0\r", type, addr, port);
+        // TODO: shall we setup a time out there ?
+        tr_info("expecting connect on: %d", id);
+    } else {
+        core_util_atomic_store_u32(&m_active_action, ActionNone);
+        id = -1;
+    }
+    return id;
 }
 
-bool WizFi310::open(const char *type, int id, const char* addr, int port)
+nsapi_error_t WizFi310::send(int id, const void *data, uint32_t amount)
 {
-    int created_sock_id;
-
-    //IDs only 0-7
-    if(id > 7) {
-        return false;
+    if ((id > 7) || (id < 0) || (data == NULL)) {
+        return NSAPI_ERROR_PARAMETER;
+    }
+    if (amount == 0) {
+        return NSAPI_ERROR_OK;
     }
 
-    if( !(_parser.send("AT+SCON=O,%s,%s,%d,,0",type,addr,port) && _parser.recv("[OK]")
-    		&& _parser.recv("[CONNECT %d]",&created_sock_id))) {
-    	return false;
+    uint32_t expected = ActionNone;
+    if (!core_util_atomic_cas_u32(&m_active_action, &expected, ActionDoSSend)) {
+        return NSAPI_ERROR_WOULD_BLOCK;
+    }
+    socket_t *s = &m_sockets[id];
+
+    if (s->status != socket_t::StatusConnected) {
+        core_util_atomic_store_u32(&m_active_action, ActionNone);
+        return NSAPI_ERROR_NO_CONNECTION;
     }
 
-    if( created_sock_id != id ) {
-       close(created_sock_id); 
-       return false;
-    }
-
-    return true;
+    m_cmd_ctx.ssend.s = s;
+    m_cmd_ctx.ssend.data = data;
+    m_cmd_ctx.ssend.amount = amount;
+    m_cmd_ctx.ssend.did_send = false;
+    m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::ssend_done);
+    this->process_cmd("AT+SSEND=%d,,,%lu\r", id, amount);
+    return NSAPI_ERROR_IN_PROGRESS;
 }
 
-bool WizFi310::dns_lookup(const char* name, char* ip)
+void WizFi310::close(int id)
 {
-	return (_parser.send("AT+FDNS=%s,5000", name) && _parser.recv("%[^\n]\r\n",ip) && _parser.recv("[OK]"));
-}
-
-bool WizFi310::send(int id, const void *data, uint32_t amount)
-{
-    char str_result[20];
-
-    if(id > 8) {
-        return false;
-    }
-
-    sprintf(str_result,"[%d,,,%d]",id,(int)amount);
-    
-    // Using _parser.printf because MCU can't send CR LF
-    if( _parser.printf("AT+SSEND=%d,,,%d\r",id, (int)amount)
-     && _parser.recv(str_result)
-     && _parser.write((char*)data, (int)amount) >= 0
-     && _parser.recv("[OK]") ){
-        return true;
-    }
-
-    return false;
-}
-
-void WizFi310::_packet_handler()
-{
-    int id;
-    char ip_addr[16];
-    int port;
-    uint32_t amount;
-
-    // parse out the packet
-    _parser.set_timeout(AT_CMD_PARSER_RECV_TIMEOUT);
-    if (!_parser.recv("%d,%[^,],%d,%d}",&id, ip_addr,&port, &amount) ) {
-        setTimeout(_timeout_ms);
+    tr_info("::close(%d)", id);
+    if ((id < 0) || (id > 7)) {
         return;
     }
 
-    struct packet *packet = new struct packet;
-    if (!packet) {
-        return;
-    }
-
-    packet->id = id;
-    packet->len = amount;
-    packet->next = 0;
-    packet->data = (char*)malloc(amount);
-
-    
-    if (!(_parser.read((char*)packet->data, amount))) {
-        free(packet);
-        setTimeout(_timeout_ms);
-        return;
-    }
-    setTimeout(_timeout_ms);
-
-    *_packets_end = packet;
-    _packets_end = &packet->next;
+    socket_t *s = &m_sockets[id];
+    // detach callbacks
+    s->mutex.lock();
+    s->cbk = NULL;
+    s->data = NULL;
+    s->mutex.unlock();
+    int evtid = m_event_queue.call(this, &WizFi310::do_sclose, id);
+    tr_debug("enqueue do_sclose: %d", evtid);
+    MBED_ASSERT(evtid != 0);
 }
 
-int32_t WizFi310::recv(int id, void *data, uint32_t amount)
+// =================================================================================================
+// private methods
+void WizFi310::heart_beat()
 {
-	while (true) {
-		// check if any packets are ready for us
-        for (struct packet **p = &_packets; *p; p = &(*p)->next) {
-            if ((*p)->id == id) {
-                struct packet *q = *p;
-                
-                if (q->len <= amount) {
-                    memcpy(data,q->data, q->len);
+    tr_debug("%s|%s attached: %d rxevtid: %d", recv_state2str(m_recv_state), action2str((action_t)m_active_action), m_attached, m_rx_event_id);
+    if (m_data_to_receive != 0) {
+        tr_debug("pending socket: %lu to_recv: %lu", (((uint32_t)m_pending_socket) - (uint32_t)(m_sockets)) / sizeof(socket_t), m_data_to_receive);
+    }
 
-                    if (_packets_end == &(*p)->next) {
-                        _packets_end = p;
+    if (m_rx_event_id != 0) {
+        tr_debug("tick: %u time left: %d", m_event_queue.tick(), m_event_queue.time_left(m_rx_event_id));
+    }
+    tr_debug("isr_buf_len: %lu line: (%lu) %.*s", m_isr_buf_len, m_line_buf_len, m_line_buf_len, m_line_buf);
+
+    // TODO: This shall not be required and is here solely for debug purposed.
+    // attach serial
+    // if it has been detached, force enqueueing the serial_event (could aswell call it from here ...)
+    if (!m_attached) {
+        m_attached = true;
+        m_serial.attach(Callback<void()>(this, &WizFi310::serial_isr));
+    }
+    core_util_critical_section_enter();
+    if (m_rx_event_id == 0) {
+        // TODO: If m_rx_event_id == 0 means that we failed at scheduling the event the previous time.
+        // Shall we loop until it's actually enqueued ?
+        m_rx_event_id = m_event_queue.call(this, &WizFi310::serial_event);
+    }
+    core_util_critical_section_exit();
+}
+
+void WizFi310::set_connection_status(nsapi_connection_status_t status)
+{
+    bool has_changed = m_connection_status != status;
+    if (has_changed) {
+        tr_debug("Wifi status change: %d", status);
+        m_connection_status = status;
+        if (m_on_status_change) {
+            m_on_status_change(status);
+        }
+    }
+}
+
+// Runs from an isr context.
+// This kind of emulates what a dma would do
+void WizFi310::serial_isr()
+{
+    if (m_rx_event_id == 0) {
+        // TODO: If m_rx_event_id == 0 means that we failed at scheduling the event the previous time.
+        // Shall we loop until it's actually enqueued ?
+        m_rx_event_id = m_event_queue.call(this, &WizFi310::serial_event);
+    }
+    if ((m_isr_buf_len >= MBED_CONF_WIZFI310_RX_BUFFER_SIZE) && m_has_hwfc) {
+        m_serial.attach(NULL); // if buffer full, detach isr, it will be reattached later
+        m_attached = false;
+        return;
+    }
+    int input = m_serial.getc();
+    if (input < 0) {
+        // TODO: do we want to catch that ?
+        return;
+    }
+
+    if (m_isr_buf_len < MBED_CONF_WIZFI310_RX_BUFFER_SIZE) {
+        m_isr_buf[m_isr_buf_len] = (char)input;
+        m_isr_buf_len += 1;
+    } else {
+        // Overrun is flagged in the serial_event.
+    }
+}
+
+void WizFi310::fatal_error(const char *msg)
+{
+    core_util_atomic_store_u32(&m_active_action, ActionBlocked);
+
+    m_serial.attach(NULL);
+    m_attached = false;
+
+    m_recv_state = ResetRequired;
+
+    tr_error("Fatal error: %s", msg);
+}
+
+// runs from the global event queue context.
+void WizFi310::serial_event()
+{
+    m_rx_event_id = 0;
+    while (true) {
+        tr_debug("isr_buf_len: %lu line: (%lu) %.*s", m_isr_buf_len, m_line_buf_len, m_line_buf_len, m_line_buf);
+        uint8_t *buf = m_work_buf;
+        uint32_t len = 0;
+        bool has_line = (m_line_buf_len != 0) && ((m_line_buf[m_line_buf_len - 1] == '\r') || (m_line_buf[m_line_buf_len - 1] == '\n'));
+        bool has_recv = false;
+
+        if (!has_line) {
+            // TODO: simplify/rationalize this, it is too complex to sit here
+            // the ratio indentation/line count is 
+            core_util_critical_section_enter();
+            bool buffer_was_full = m_isr_buf_len == MBED_CONF_WIZFI310_RX_BUFFER_SIZE;
+            switch (m_recv_state) {
+                case ResetRequired:
+                    break;
+                case Recv: {
+                    if ((m_pending_packet != NULL) || !m_has_hwfc) {
+                        // extract as much as needed to exhaust the current packet.
+                        if (m_data_to_receive > m_isr_buf_len) {
+                            len = m_isr_buf_len;
+                        } else {
+                            len = m_data_to_receive;
+                        }
                     }
-                    *p = (*p)->next;
 
-                    uint32_t len = q->len;
-                    free(q);
-                    return len;
-                } else { // return only partial packet
-                    memcpy(data, q->data, amount);
-                    
-                    q->len -= amount;
-                    memmove(q->data, (uint8_t*)(q->data) + amount, q->len);
-                    return amount;
+                    // consume len from m_isr_buf
+                    // has no effect is len == 0.
+                    consume(buf, m_isr_buf, m_isr_buf_len, len);
+                    break;
+                }
+                case RecvEnd: {
+                    if (m_isr_buf_len >= 2) {
+                        m_isr_buf_len -= 2;
+                        memmove(m_isr_buf, m_isr_buf + 2, m_isr_buf_len);
+                        core_util_critical_section_exit();
+                        m_recv_state = m_prev_state;
+                        continue;
+                    }
+                    break;
+                }
+                default: {
+                    // search for recv event or eol
+                    uint8_t *ptr = NULL;
+                    for (uint32_t i = 0; i < m_isr_buf_len; i++) {
+                        if ((m_isr_buf[i] == '{') || (m_isr_buf[i] == '\r') || (m_isr_buf[i] == '\n')) {
+                            ptr = &m_isr_buf[i];
+                            break;
+                        }
+                    }
+
+                    if (ptr != NULL) {
+                        has_recv = *ptr == '{';
+                        has_line = !has_recv;
+                        len = ptr - m_isr_buf;
+
+                        // if we matched an eol, then include it in the copy.
+                        if (has_line) {
+                            len += 1;
+                        }
+                    }
+                    if ((m_line_buf_len + len) > MBED_CONF_WIZFI310_LINE_BUFFER_SIZE) {
+                        core_util_critical_section_exit();
+                        this->fatal_error("Line buffer overrun");
+                        return;
+                    }
+                    consume(m_line_buf + m_line_buf_len, m_isr_buf, m_isr_buf_len, len);
+                    m_line_buf_len += len;
+
+                    if (m_isr_buf[0] == '{') {
+                        ptr = (uint8_t *)memchr(m_isr_buf, '}', m_isr_buf_len);
+                        has_recv &= ptr != NULL;
+                        if (has_recv) {
+                            len = (ptr - m_isr_buf) + 1;
+                            consume(buf, m_isr_buf, m_isr_buf_len, len);
+                        } else {
+                            len = 0;
+                        }
+                    }
+                    if (!has_line && !has_recv && (m_isr_buf_len == MBED_CONF_WIZFI310_RX_BUFFER_SIZE)) {
+                        core_util_critical_section_exit();
+                        this->fatal_error("rx buffer overrun");
+                        return;
+                    }
+                    break;
                 }
             }
+            core_util_critical_section_exit();
         }
 
-        // check for inbound packets
-        if (!_parser.process_oob()) {
-            return -1;
+        if (!has_recv && has_line) {
+            buf = m_line_buf;
+            len = m_line_buf_len;
+        }
+
+        if ((m_recv_state == Recv) && ((len != 0) || (m_pending_packet == NULL))) {
+            // if we are in recv mode and we either read something or we need to allocated a packet, proceed to the recv_state_update method.
+            if (this->recv_state_update((char *)buf, len)) {
+                // if recv_state_update returns false, we exit the loop and come back later.
+                // this shall only happen if m_recv_state == recv & m_pending_packet == null.
+                break;
+            }
+        } else if (has_line || has_recv) {
+            // if we found an recv header or a complete line
+            //      clear the eol if any
+            //      proceed to recv_state_update.
+            if ((buf[0] != '{') && ((buf[len - 1] == '\n') || (buf[len - 1] == '\r'))) {
+                len -= 1; // remove eol byte from the line.
+            }
+            if (len != 0) {
+                buf[len] = '\0';
+                this->recv_state_update((char *)buf, len);
+            }
+            if (has_line) {
+                m_line_buf_len = 0;
+            }
+        } else {
+            // we're done (not enough data), break the loop.
+            break;
         }
     }
+    m_attached = true;
+    m_serial.attach(Callback<void()>(this, &WizFi310::serial_isr));
 }
 
-bool WizFi310::close(int id)
+// TODO: make this cleaner,
+// An array of callback using the recv_state_t as an index could be a nicer dispatch tool than this big switch.
+bool WizFi310::recv_state_update(char *buf, uint32_t len)
 {
-    char sock_event_msg[15];
+    int id;
+    char fw_rev[9] = {0};
+    char ip[16] = {0};
+    uint16_t port;
+    uint32_t plen;
 
-    if(id > 7) {
-        return false;
+    if (m_recv_state != Recv) {
+        tr_info("%s|%s: received: (%3lu) %.*s", recv_state2str(m_recv_state), action2str((action_t)m_active_action), len, (int)len, buf);
+        if (this->parse_recv(buf, len, id, ip, port, plen)) {
+            // tr_debug("recv: %d (%s:%hu): %lu", id, ip, port, plen);
+            m_data_to_receive = plen;
+            m_pending_socket = &m_sockets[id];
+            // TODO: update socket's ip/port
+            m_prev_state = m_recv_state;
+            m_recv_state = Recv;
+            return false;
+        }
+
+    } else {
+        // tr_info("%s|%s: received: (%3lu) %s", recv_state2str(m_recv_state), action2str((action_t)m_active_action), len, print_buf(buf, len));
+        // tr_info("%s|%s: received: (%3lu) <bin>", recv_state2str(m_recv_state), action2str((action_t)m_active_action), len);
     }
 
-    if (_parser.send("AT+SMGMT=%d", id) && _parser.recv(sock_event_msg) && _parser.recv("[OK]") )
-    {
-        return true;
-    }
+    switch (m_recv_state) {
+        case Unknown: {
+            if (this->parse_greeting(buf, len, fw_rev)) {
+                if (m_greetings_cbk) {
+                    m_greetings_cbk(fw_rev);
+                }
+            } else {
+                // ignore unexpected messaages
+            }
+            break;
+        }
+        case LinkUpIP: {
+            if (this->parse_linkup_ip(buf, len, m_ip_buffer)) {
+                m_recv_state = LinkUpGW;
+            } else {
+                tr_warn("unexpected: %.*s", (int)len, buf);
+                this->fatal_error("Unexpected message");
+            }
+            break;
+        }
+        case LinkUpGW: {
+            if (this->parse_linkup_gw(buf, len, m_gateway_buffer)) {
+                this->set_connection_status(NSAPI_STATUS_GLOBAL_UP);
+                m_recv_state = Ready;
+            } else {
+                tr_warn("unexpected: %.*s", (int)len, buf);
+                this->fatal_error("Unexpected message");
+            }
+            break;
+        }
+        case Status: {
+            int32_t t;
+            if (this->parse_status(buf, len, m_ip_buffer, m_gateway_buffer, m_mac_buffer, t)) {
+                m_rssi = t;
+                m_recv_state = Ready;
+            } else {
+                tr_warn("Unexpected: %.*s", (int)len, buf);
+                this->fatal_error("Unexpected message");
+            }
+            break;
+        }
+        case Scan: {
+            nsapi_wifi_ap_t ap = {0};
+            if (this->parse_ap(buf, len, &ap)) {
+                if (m_scan_ap_cbk) {
+                    m_scan_ap_cbk(&ap);
+                }
+            } else if (strcmp(buf, "[OK]") == 0) {
+                if (m_scan_ap_cbk) {
+                    m_scan_ap_cbk(NULL);
+                }
+                this->end_action();
+                m_recv_state = Ready;
+            } else {
+                tr_warn("Unexpected: %.*s", (int)len, buf);
+                this->fatal_error("Unexpected message");
+            }
+            break;
+        }
+        case Recv: {
+            if (m_pending_packet == NULL) {
+                if ((m_heap_used + m_data_to_receive) >= MBED_CONF_WIZFI310_MAX_HEAP_USAGE) {
+                    tr_warn("cannot allocate yet, wait for next attempt");
+                    return true;
+                } else {
+                    m_pending_packet = Packet::new_packet(m_data_to_receive, m_heap_used);
+                    if (!m_has_hwfc && (m_pending_packet == NULL)) {
+                        // TODO: dropping data for this socket, we may want to close it
+                    }
+                }
+            }
+            if ((m_pending_packet != NULL) && (len != 0)) {
+                Packet *p = m_pending_packet;
+                MBED_ASSERT(p->append(buf, len) == len);
+                m_data_to_receive -= len;
 
+                if (m_data_to_receive == 0) {
+                    socket_t *s = m_pending_socket;
+
+                    m_recv_state = RecvEnd;
+                    m_pending_packet = NULL;
+                    m_pending_socket = NULL;
+
+                    socket_event_data_t data;
+                    data.data_received.packet = p;
+                    s->notify(EventDataReceived, data);
+                }
+            }
+            break;
+        }
+        default: {
+            cmd_resp_t rsp;
+            if (this->parse_greeting(buf, len, fw_rev)) {
+                if (m_greetings_cbk) {
+                    m_greetings_cbk(fw_rev);
+                }
+            } else if (strcmp(buf, "[OK]") == 0) {
+                if (m_on_cmd_end) {
+                    Callback<void(cmd_resp_t)> cbk = m_on_cmd_end;
+                    m_on_cmd_end = NULL;
+                    cbk(CmdRspOk);
+                }
+            } else if (strncmp(buf, "AT", 2) == 0) {
+                // echo enabled
+            } else if (this->parse_error(buf, len, rsp)) {
+                tr_debug("Error: %d", rsp);
+                if (m_on_cmd_end) {
+                    Callback<void(cmd_resp_t)> cbk = m_on_cmd_end;
+                    m_on_cmd_end = NULL;
+                    cbk(rsp);
+                }
+            } else if (strcmp(buf, "[Link-Up Event]") == 0) {
+                m_recv_state = LinkUpIP;
+            } else if (strcmp(buf, "[Link-Down Event]") == 0) {
+                if ((m_connection_status != NSAPI_STATUS_CONNECTING) || (m_cmd_ctx.connect.attempt == MBED_CONF_WIZFI310_CONNECT_MAX_ATTEMPT)) {
+                    this->set_connection_status(NSAPI_STATUS_DISCONNECTED);
+                }
+                // we may as well want to reset all sockets.
+            } else if (strcmp(buf, "IF/SSID/IP-Addr/Gateway/MAC/TxPower(dBm)/RSSI(-dBm)") == 0) {
+                MBED_ASSERT(m_active_action == ActionDoStatus);
+                m_recv_state = Status;
+            } else if (strcmp(buf, "Index/SSID/BSSID/RSSI(-dBm)/MaxDataRate(Mbps)/Security/RadioBand(GHz)/Channel") == 0) {
+                MBED_ASSERT(m_active_action == ActionDoScan);
+                m_recv_state = Scan;
+            } else if (this->parse_connect(buf, len, id)) {
+                socket_t *s = &m_sockets[id];
+                s->mutex.lock();
+                if (s->status != socket_t::StatusConnecting) {
+                    tr_warn("Unexpected connection on socket %d", id);
+                } else if (core_util_atomic_load_u32(&m_active_action) == ActionDoSOpen) {
+                    core_util_atomic_store_u32(&m_active_action, ActionNone);
+                }
+                s->status = socket_t::StatusConnected;
+                socket_event_data_t data;
+                s->notify(EventConnected, data);
+                s->mutex.unlock();
+            } else if (this->parse_disconnect(buf, len, id)) {
+                socket_t *s = &m_sockets[id];
+                uint32_t act = core_util_atomic_load_u32(&m_active_action);
+
+                s->mutex.lock();
+                if (s->status == socket_t::StatusDisconnected) {
+                    tr_warn("Socket %d is already disconnected", id);
+                } else {
+                    // tr_debug("act: %s s->status: %s", action2str((action_t)act), socket_t::status2str(s->status));
+                    if ((act == ActionDoSOpen) && (s->status == socket_t::StatusConnecting)) {
+                        core_util_atomic_store_u32(&m_active_action, ActionNone);
+                    } else {
+                        if ((act == ActionDoSClose) && (id == m_cmd_ctx.sclose.id)) {
+                            if (m_cmd_ctx.sclose.done) {
+                                core_util_atomic_store_u32(&m_active_action, ActionNone);
+                            } else {
+                                m_cmd_ctx.sclose.id = -1;
+                            }
+                        }
+                    }
+                }
+                if (s->status != socket_t::StatusDisconnected) {
+                    s->status = socket_t::StatusDisconnected;
+                    socket_event_data_t data;
+                    s->notify(EventDisconnected, data);
+                }
+                act = core_util_atomic_load_u32(&m_active_action);
+                // tr_debug("act: %s s->status: %s", action2str((action_t)act), socket_t::status2str(s->status));
+                s->mutex.unlock();
+            } else if (this->parse_send_rdy(buf, len, id, plen)) {
+                MBED_ASSERT(m_active_action == ActionDoSSend);
+                MBED_ASSERT(plen == m_cmd_ctx.ssend.amount);
+                const char *data = (const char *)m_cmd_ctx.ssend.data;
+                // tr_debug("Sending on %d: %s", id, print_buf(data, plen));
+                for (uint32_t i = 0; i < plen; i++) {
+                    m_serial.putc(*data);
+                    data++;
+                }
+                m_cmd_ctx.ssend.did_send = true;
+                // send completion is signal by [OK].
+            } else if (this->parse_mac(buf, len, m_mac_buffer)) {
+                // TODO: anything to do here ?
+            } else if (this->parse_ip(buf, len, m_ip_buffer)) {
+                // TODO: anything to do here ?
+            } else {
+                tr_warn("matches none: %.*s", (int)len, buf);
+            }
+            break;
+        }
+    }
     return false;
 }
 
-void WizFi310::setTimeout(uint32_t timeout_ms)
+void WizFi310::process_cmd(const char *cmd, ...)
 {
-    _parser.set_timeout(timeout_ms);
-    _timeout_ms = timeout_ms;
+    va_list args;
+    va_start(args, cmd);
+    if (MBED_TRACE_MAX_LEVEL >= TRACE_LEVEL_INFO) {
+        char output[256];
+        int len = vsnprintf(output, 256, cmd, args);
+        tr_info("%s|%s: sending: %.*s", recv_state2str(m_recv_state), action2str((action_t)m_active_action), len, output);
+        (void)len;
+    }
+    m_serial.vprintf(cmd, args);
+    va_end(args);
 }
 
-bool WizFi310::readable()
+void WizFi310::end_action()
 {
-    return _serial.FileHandle::readable();
+    core_util_atomic_store_u32(&m_active_action, ActionNone);
 }
 
-bool WizFi310::writeable()
+// runs on the private event queue
+void WizFi310::do_reset()
 {
-    return _serial.FileHandle::writable();
+    m_serial.attach(NULL);
+    m_attached = false;
+    if (m_rst != NC) {
+        m_nrst_pin = 0;
+        // TODO: we may cause a framing error on the m_serial if we cut a transmition
+    }
+
+    core_util_critical_section_enter();
+    if (m_rx_event_id != 0) {
+        m_event_queue.cancel(m_rx_event_id);
+        m_rx_event_id = 0;
+    }
+    core_util_critical_section_exit();
+
+    m_isr_buf_len = 0;
+    m_line_buf_len = 0;
+    m_recv_state = Unknown;
+    m_on_cmd_end = NULL;
+    m_data_to_receive = 0;
+    if (m_pending_packet != NULL) {
+        delete m_pending_packet;
+        m_pending_packet = NULL;
+    }
+    m_pending_socket = NULL;
+    for (uint8_t i = 0; i < WIZFI310_SOCKET_COUNT; i++) {
+        m_sockets[i].reset();
+    }
+    MBED_ASSERT(m_heap_used == 0); // all packet must be freed prior to reset
+    m_dhcp = true;
+    if (m_rst == NC) {
+        tr_warn("Using software reset may give unexpected results due to reception latency.");
+    } else {
+        // clear
+        wait_ms(250);
+        m_nrst_pin = 1;
+        wait_ms(500);
+        // flushes the serial port
+        while (m_serial.getc() != -1);
+    }
+
+    m_attached = true;
+    m_serial.attach(Callback<void()>(this, &WizFi310::serial_isr));
+
+    // this is a factory reset
+    this->process_cmd("AT+MFDEF=FR\r");
+
+    // TODO: setup a timeout ?
+    m_greetings_cbk = Callback<void(const char[8])>(this, &WizFi310::do_echo_off);
 }
 
-void WizFi310::attach(Callback<void()> func)
+// runs on the event queue
+void WizFi310::do_echo_off(const char fw_rev[8])
 {
-    _serial.sigio(func);
+    m_greetings_cbk = NULL;
+    memcpy(m_firmware_rev, fw_rev, 8);
+    m_recv_state = Ready;
+    this->process_cmd("AT+MECHO=0\r");
+    m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::do_setup_serial);
 }
 
-bool WizFi310::recv_ap(nsapi_wifi_ap_t *ap)
+// runs on the event queue
+void WizFi310::do_setup_serial(cmd_resp_t rsp)
 {
-    char scan_result[100];
-    char sec[10];
-    char bssid[32];
-    char* idx_ptr;
-    char* bssid_ptr;
-    
-    _parser.recv("%s\r\n",scan_result);
-    if( strcmp(scan_result,"[OK]") == 0 )
-    {
-        return false;
+    if (rsp != CmdRspOk) {
+        this->fatal_error("Failed to turn echo off");
+        return;
     }
 
-    idx_ptr = strtok((char*)scan_result, "/");      // index
-
-    idx_ptr = strtok( NULL, "/" );                  // ssid
-    strncpy(ap->ssid,idx_ptr,strlen(idx_ptr));
-    ap->ssid[strlen(idx_ptr)] = '\0';
-
-    idx_ptr = strtok( NULL, "/" );                  // bssid
-    strncpy(bssid,idx_ptr,strlen(idx_ptr));
-    bssid[strlen(idx_ptr)] = '\0';
-    
-    idx_ptr = strtok( NULL, "/" );                  // RSSI
-    ap->rssi = atoi(idx_ptr);
-
-    //idx_ptr = strtok( NULL, "/" );                  // DataRate
-    
-    idx_ptr = strtok( NULL, "/" );                  // Security
-    strncpy(sec,idx_ptr,strlen(idx_ptr));
-    sec[strlen(idx_ptr)] = '\0';
-    ap->security = str2sec(sec);
-
-    idx_ptr = strtok( NULL, "/" );                  // RadioBand
-
-    idx_ptr = strtok( NULL, "/" );                  // Channel
-    ap->channel = atoi(idx_ptr);
-
-    // Set BSSID
-    bssid_ptr = strtok( (char*)bssid, ":");
-    ap->bssid[0] = hex_str_to_int(bssid_ptr);
-
-    for(int i=1; i<6; i++)
+#ifdef DEVICE_SERIAL_FC
+    if (m_has_hwfc) {
+        this->process_cmd("AT+USET=115200,N,8,1,HW\r");
+    } else
+#endif
     {
-        bssid_ptr = strtok( NULL, ":");
-        ap->bssid[i] = hex_str_to_int(bssid_ptr);
+        // this shall have no effect as other wise we would be reaching this point.
+        // we may in the future want to use a higher speed.
+        this->process_cmd("AT+USET=115200,N,8,1,N\r");
     }
-
-    return true; 
+    m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::serial_setup_done);
 }
 
-nsapi_security_t WizFi310::str2sec(const char *str_sec)
+void WizFi310::serial_setup_done(cmd_resp_t rsp)
 {
-    if( strcmp(str_sec,"Open") == 0 )
-    {
-        return NSAPI_SECURITY_NONE;
+    if (rsp != CmdRspOk) {
+        // signal end of connect
+        this->fatal_error("Failed to setup the serial line");
+        return;
     }
-    else if( strcmp(str_sec,"WEP") == 0 )
-    {
-        return NSAPI_SECURITY_WEP;
+    if (m_has_hwfc) {
+        tr_debug("enabling flow control");
+        m_serial.set_flow_control(SerialBase::RTSCTS, m_rts, m_cts);
     }
-    else if( strcmp(str_sec,"WPA") == 0 )
-    {
-        return NSAPI_SECURITY_WPA;
-    }
-    else if( strcmp(str_sec,"WPA2") == 0 )
-    {
-        return NSAPI_SECURITY_WPA2;
-    }
-    else if( strcmp(str_sec,"WPAWPA2") == 0 )
-    {
-        return NSAPI_SECURITY_WPA_WPA2;
-    }
-
-    return NSAPI_SECURITY_UNKNOWN;
+    m_greetings_cbk = Callback<void(const char[8])>(this, &WizFi310::device_ready);
 }
 
-int WizFi310::hex_str_to_int(const char* hex_str)
+void WizFi310::device_ready(const char fw_rev[8])
 {
-    int n = 0;
-    uint32_t value = 0;
-    int shift = 7;
-    while (hex_str[n] != '\0' && n < 8)
-    {
-        if ( hex_str[n] > 0x21 && hex_str[n] < 0x40 )
-        {
-            value |= (hex_str[n] & 0x0f) << (shift << 2);
-        }
-        else if ( (hex_str[n] >= 'a' && hex_str[n] <= 'f') || (hex_str[n] >= 'A' && hex_str[n] <= 'F') )
-        {
-            value |= ((hex_str[n] & 0x0f) + 9) << (shift << 2);
-        }
-        else
-        {
-            break;
-        }
-        n++;
-        shift--;
+    (void)fw_rev; // not used here.
+    m_greetings_cbk = NULL;
+
+    if (m_active_action == ActionDoConnect) {
+        this->do_set_access_point();
+    } else if (m_active_action == ActionDoScan) {
+        this->do_scan();
+    } else {
+        this->fatal_error("Unexpected path to device_ready.");
+    }
+}
+
+void WizFi310::do_set_access_point()
+{
+    this->process_cmd("AT+WSET=0,%s\r", m_cmd_ctx.connect.ap);
+    m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::do_set_password);
+}
+
+// runs from the event queue
+void WizFi310::do_set_password(cmd_resp_t rsp)
+{
+    if (rsp != CmdRspOk) {
+        tr_error("Failed to set accesspoint name %s: %u", m_cmd_ctx.connect.ap, rsp);
+        this->set_connection_status(NSAPI_STATUS_DISCONNECTED);
+        this->end_action();
+        return;
     }
 
-    return (value >> ((shift + 1) << 2));
+    if (strcmp(m_cmd_ctx.connect.sec, "OPEN") == 0) {
+        this->process_cmd("AT+WSEC=0,,12345678\r");
+    } else {
+        this->process_cmd("AT+WSEC=0,,%s\r", m_cmd_ctx.connect.pw);
+    }
+    m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::do_set_dhcp);
+}
+
+// runs from the event queue
+void WizFi310::do_set_dhcp(cmd_resp_t rsp)
+{
+    if (rsp != CmdRspOk) {
+        tr_error("Failed to set password %s (%s): %u", m_cmd_ctx.connect.pw, m_cmd_ctx.connect.sec, rsp);
+        this->set_connection_status(NSAPI_STATUS_DISCONNECTED);
+        this->end_action();
+        return;
+    }
+
+    if (m_dhcp) {
+        this->process_cmd("AT+WNET=1\r");
+    } else {
+        // we need to have a way to set these
+        this->process_cmd("AT+WNET=0,%s,%s,%s\r", m_ip_buffer, m_netmask_buffer, m_gateway_buffer);
+    }
+    m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::do_join);
+}
+
+// runs from the event queue
+void WizFi310::do_join(cmd_resp_t rsp)
+{
+    if (rsp != CmdRspOk) {
+        tr_error("Failed configure dhcp: %s (%s,%s,%s)",
+                 m_dhcp ? "enabled" : "disabled", m_ip_buffer, m_netmask_buffer, m_gateway_buffer);
+        this->set_connection_status(NSAPI_STATUS_DISCONNECTED);
+        this->end_action();
+        return;
+    }
+    this->process_cmd("AT+WJOIN\r");
+    m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::join_done);
+}
+
+// runs from the event queue
+void WizFi310::join_done(cmd_resp_t rsp)
+{
+    if (m_connection_status == NSAPI_STATUS_GLOBAL_UP) {
+        this->end_action();
+    } else if (m_cmd_ctx.connect.attempt < MBED_CONF_WIZFI310_CONNECT_MAX_ATTEMPT) {
+        m_cmd_ctx.connect.attempt += 1;
+        this->do_join(CmdRspOk);
+    } else {
+        this->end_action();
+    }
+}
+
+void WizFi310::do_scan()
+{
+    this->process_cmd("AT+WSCAN\r");
+}
+
+// runs from the event queue
+void WizFi310::leave_done(cmd_resp_t rsp)
+{
+    this->end_action();
+}
+
+const char *WizFi310::get_ip_address()
+{
+    return m_ip_buffer;
+}
+
+void WizFi310::sopen_done(cmd_resp_t rsp)
+{
+    socket_t *s = m_cmd_ctx.sopen.s;
+
+    if (rsp != CmdRspOk) {
+        MBED_ASSERT(m_active_action != ActionDoSSend);
+        core_util_atomic_store_u32(&m_active_action, ActionNone);
+        socket_event_data_t data;
+        s->notify(EventDisconnected, data);
+    }
+}
+
+void WizFi310::ssend_done(cmd_resp_t rsp)
+{
+    nsapi_error_t res = NSAPI_ERROR_OK;
+
+
+    if (rsp == CmdRspErrorInvalidInput) {
+        res = NSAPI_ERROR_PARAMETER;
+    } else if (rsp != CmdRspOk) {
+        MBED_ASSERT(m_cmd_ctx.ssend.did_send);
+        res = NSAPI_ERROR_DEVICE_ERROR;
+    }
+    socket_t *s = m_cmd_ctx.ssend.s;
+    uint32_t sent = m_cmd_ctx.ssend.amount;
+    this->end_action();
+
+    socket_event_data_t data;
+    data.data_sent.amount_or_error = sent;
+    s->notify(EventDataSent, data);
+}
+
+void WizFi310::do_sclose(int id)
+{
+    uint32_t expected = ActionNone;
+    socket_t *s = &m_sockets[id];
+    tr_debug("::do_close(%d): %s", id, socket_t::status2str(s->status));
+    if (s->status == socket_t::StatusDisconnected) {
+        return;
+    }
+    if (!core_util_atomic_cas_u32(&m_active_action, &expected, ActionDoSClose)) {
+        m_event_queue.call(this, &WizFi310::do_sclose, id);
+        return;
+    }
+    m_cmd_ctx.sclose.id = id;
+    m_cmd_ctx.sclose.done = false;
+    this->process_cmd("AT+SMGMT=%d\r", id);
+    m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::sclose_done);
+}
+
+void WizFi310::sclose_done(cmd_resp_t rsp)
+{
+    int id = m_cmd_ctx.sclose.id;
+    if (rsp != CmdRspOk) {
+        MBED_ASSERT(m_active_action != ActionDoSSend);
+        core_util_atomic_store_u32(&m_active_action, ActionNone);
+        m_event_queue.call(this, &WizFi310::do_sclose, id);
+    } else if (id < 0) {
+        MBED_ASSERT(m_active_action != ActionDoSSend);
+        core_util_atomic_store_u32(&m_active_action, ActionNone);
+    } else {
+        m_cmd_ctx.sclose.done = true;
+    }
+}
+
+void WizFi310::socket_t::reset()
+{
+    this->mutex.lock();
+    if (this->status != socket_t::StatusDisconnected) {
+        this->status = socket_t::StatusDisconnected;
+        socket_event_data_t data;
+        this->notify(EventDisconnected, data);
+    }
+    this->mutex.unlock();
+}
+
+// must be called when the mutex is locked
+void WizFi310::socket_t::notify(socket_event_t evt, socket_event_data_t &data)
+{
+    this->mutex.lock();
+    if (this->cbk) {
+        this->cbk(this->data, evt, data);
+    } else if (evt == EventDataReceived) {
+        // nobody will take ownership of this packet.
+        tr_warning("Receiving %lu bytes on a closed socket.", data.data_received.packet->len());
+        delete data.data_received.packet;
+    }
+    this->mutex.unlock();
 }
 

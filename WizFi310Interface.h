@@ -36,24 +36,24 @@
 #ifndef WIZFI310_INTERFACE_H
 #define WIZFI310_INTERFACE_H
 
+#include "mbed_trace.h"
 #include "NetworkStack.h"
 #include "WiFiInterface.h"
 #include "WizFi310.h"
 
-#define WIZFI310_SOCKET_COUNT 8
-
 /** WizFi310Interface class
  *  Implementation of the NetworkStack for the WizFi310
  */
-class WizFi310Interface : public NetworkStack, public WiFiInterface
-{
+class WizFi310Interface : public NetworkStack, public WiFiInterface {
 public:
     /* WizFi310Interface constructor
      */
 
     WizFi310Interface(PinName tx = MBED_CONF_WIZFI310_TX,
                       PinName rx = MBED_CONF_WIZFI310_RX,
-                      bool debug = MBED_CONF_WIZFI310_DEBUG);
+                      PinName rts = MBED_CONF_WIZFI310_RTS,
+                      PinName cts = MBED_CONF_WIZFI310_CTS,
+                      PinName rst = MBED_CONF_WIZFI310_RST);
 
     /** Start the interface
      *
@@ -75,7 +75,7 @@ public:
      *  @return          0 on success, or error code on failure
      */
     virtual int connect(const char *ssid, const char *pass, nsapi_security_t security = NSAPI_SECURITY_NONE,
-                                  uint8_t channel = 0);
+                        uint8_t channel = 0);
 
     /** Set the WiFi network credentials
      *
@@ -100,72 +100,17 @@ public:
      *  @return             0 on success, negative on failure
      */
     virtual int disconnect();
+    virtual nsapi_connection_status_t get_connection_status() const;
 
-    /** Get the internally stored IP address
-     *  @return             IP address of the interface or null if not yet connected
-     */
     virtual const char *get_ip_address();
-
-    /** Get the internally stored MAC address
-     *  @return             MAC address of the interface
-     */
-    virtual const char *get_mac_address();
-
-     /** Get the local gateway
-     *
-     *  @return         Null-terminated representation of the local gateway
-     *                  or null if no network mask has been recieved
-     */
-    virtual const char *get_gateway();
-
-    /** Get the local network mask
-     *
-     *  @return         Null-terminated representation of the local network mask
-     *                  or null if no network mask has been recieved
-     */
-    virtual const char *get_netmask();
 
     /** Gets the current radio signal strength for active connection
      *
      * @return          Connection strength in dBm (negative value)
      */
     virtual int8_t get_rssi();
-
-    /** Scan for available networks
-     *
-     * This function will block.
-     *
-     * @param  ap       Pointer to allocated array to store discovered AP
-     * @param  count    Size of allocated @a res array, or 0 to only count available AP
-     * @return          Number of entries in @a, or if @a count was 0 number of available networks, negative on error
-     *                  see @a nsapi_error
-     */
-    virtual int scan(WiFiAccessPoint *res, unsigned count);
-
-    /** Translates a hostname to an IP address with specific version
-     *
-     *  The hostname may be either a domain name or an IP address. If the
-     *  hostname is an IP address, no network transactions will be performed.
-     *
-     *  If no stack-specific DNS resolution is provided, the hostname
-     *  will be resolve using a UDP socket on the stack.
-     *
-     *  @param address  Destination for the host SocketAddress
-     *  @param host     Hostname to resolve
-     *  @param version  IP version of address to resolve, NSAPI_UNSPEC indicates
-     *                  version is chosen by the stack (defaults to NSAPI_UNSPEC)
-     *  @return         0 on success, negative error code on failure
-     */
-    //using NetworkInterface::gethostbyname;
-    virtual nsapi_error_t gethostbyname(const char *host,
-            SocketAddress *address, nsapi_version_t version = NSAPI_UNSPEC);
-
-    /** Add a domain name server to list of servers to query
-     *
-     *  @param addr     Destination for the host address
-     *  @return         0 on success, negative error code on failure
-     */
-    using NetworkInterface::add_dns_server;
+    virtual nsapi_size_or_error_t scan(WiFiAccessPoint *res, nsapi_size_t count);
+    virtual void attach(Callback<void(nsapi_event_t, intptr_t)> status_cb);
 
 protected:
     /** Open a socket
@@ -266,30 +211,69 @@ protected:
      */
     virtual void socket_attach(void *handle, void (*callback)(void *), void *data);
 
-     /** Provide access to the NetworkStack object
-     *
-     *  @return The underlying NetworkStack object
-     */
+    /** Provide access to the NetworkStack object
+    *
+    *  @return The underlying NetworkStack object
+    */
     virtual NetworkStack *get_stack()
     {
         return this;
     }
 
 private:
-    WizFi310 _wizfi310;
-    bool _ids[WIZFI310_SOCKET_COUNT];
+    struct wizfi310_socket {
+        WizFi310 &wifi;
+        Mutex op_mtx;
+        Mutex state_mtx;
+        nsapi_protocol_t proto;
+        SocketAddress addr;
+        Packet *first;
+        Packet *last;
+
+        int id;
+        volatile bool connected;
+
+        Semaphore semphr;
+        Callback<void (void *)> cbk;
+        void *data;
+
+        wizfi310_socket(WizFi310 &wiz, nsapi_protocol_t proto):
+            wifi(wiz),
+            op_mtx("wizfi310_socket_op"),
+            state_mtx("wizfi310_socket_state"),
+            proto(proto), first(NULL), last(NULL),
+            id(-1), connected(false),
+            semphr(0, 1), cbk(NULL), data(NULL) {}
+
+
+        void close();
+
+        ~wizfi310_socket();
+    };
+    struct scan_ctx_t {
+        uint32_t count;
+        uint32_t idx;
+        WiFiAccessPoint *res;
+    } volatile m_scan_ctx;
+
+    WizFi310 m_wizfi310;
 
     char ap_ssid[33]; /* 32 is what 802.11 defines as longest possible name; +1 for the \0 */
     nsapi_security_t ap_sec;
     uint8_t ap_ch;
     char ap_pass[64]; /* The longest allowed passphrase */
 
-    void event();
+    Mutex m_mutex;
+    Semaphore m_semphr;
+    Callback<void(nsapi_event_t, intptr_t)>  m_on_status_change;
+    uint32_t m_socket_count;
 
-    struct {
-        void (*callback)(void *);
-        void *data;
-    } _cbs[WIZFI310_SOCKET_COUNT];
+
+    void evt_rdy(bool dhcp, const char *ip, const char *gw, const char *mac);
+    void do_send_data(wizfi310_socket *s);
+    void scan_ap(nsapi_wifi_ap_t *ap);
+    void link_status_change(nsapi_connection_status_t event);
+    static void socket_event(void *ctx, WizFi310::socket_event_t type, WizFi310::socket_event_data_t &data);
 };
 
 #endif

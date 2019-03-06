@@ -1,7 +1,6 @@
 {
     "name": "wizfi310",
     "config": {
-
         "tx": {
             "help": "TX pin for serial connection to external device (WizFi310)",
             "value": "NC"
@@ -10,8 +9,44 @@
             "help": "RX pin for serial connection to external device (WizFi310)",
             "value": "NC"
         },
-        "debug": {
-            "help": "Enable debug logs for (WizFi310)",
+        "rts": {
+            "help": "RTS pin for serial connection to external device (WizFi310)",
+            "value": "NC"
+        },
+        "cts": {
+            "help": "CTS pin for serial connection to external device (WizFi310)",
+            "value": "NC"
+        },
+        "rst": {
+            "help": "RST pin for module hardware reset (WizFi310).",
+            "value": "NC"
+        },
+        "rx-buffer-size": {
+            "help": "reception buffer size",
+            "value": 256
+        },
+        "line-buffer-size": {
+            "help": "line buffer size",
+            "value": 128
+        },
+        "max-heap-usage": {
+            "help": "Maximum heap usage allowed for each instance of this driver.",
+            "value": "4*1024"
+        },
+        "event-queue-size": {
+            "help": "Size of the event queue (this should contain at most <placeholder> items).",
+            "value": "(1*1024)"
+        },
+        "stacksize": {
+            "help": "Stack size of the event queue dispatcher thread.",
+            "value": 2048
+        },
+        "connect-max-attempt": {
+            "help": "Maximum number of time a connect will try before returning error.",
+            "value": "3"
+        },
+        "provide-default": {
+            "help": "Provide default WifiInterface. [true/false]",
             "value": false
         }
     }
