@@ -305,19 +305,13 @@ void WizFi310::_packet_handler()
         return;
     }
 
-    struct packet *packet = new struct packet;
+	struct packet *packet = new struct packet(id, amount);
     if (!packet) {
         return;
     }
 
-    packet->id = id;
-    packet->len = amount;
-    packet->next = 0;
-    packet->data = (char*)malloc(amount);
-
-    
     if (!(_parser.read((char*)packet->data, amount))) {
-        free(packet);
+		delete(packet);
         setTimeout(_timeout_ms);
         return;
     }

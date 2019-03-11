@@ -237,6 +237,12 @@ private:
         uint32_t len;
         // data follows
         char *data;
+		packet( int new_id, uint32_t new_len): next(NULL), id(new_id), len(new_len) {
+            this->data = new char[this->len];
+        }
+        ~packet() {
+            delete this->data;
+        }
     } *_packets, **_packets_end;
     void _packet_handler();
     //void _socket_close_handler();
