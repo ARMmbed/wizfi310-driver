@@ -39,6 +39,8 @@
 #include "ATCmdParser.h"
 #include "netsocket/WiFiAccessPoint.h"
 #include "UARTSerial.h"
+#include "nsapi_types.h"
+#include "rtos.h"
 
 /** WizFi310Interface class.
     This is an interface to a WizFi310Interface radio.
@@ -46,7 +48,7 @@
 class WizFi310
 {
 public:
-    WizFi310(PinName tx, PinName rx, bool debug=false);
+    WizFi310(PinName tx, PinName rx, PinName rts, PinName cts, bool debug=false);
 
     /**
     * Check firmware version of WizFi310
@@ -175,14 +177,24 @@ public:
     bool send(int id, const void *data, uint32_t amount);
 
     /**
-    * Receives data from an open socket
+    * Receives stream data from an open TCP socket
     *
     * @param id id to receive from
     * @param data placeholder for returned information
     * @param amount number of bytes to be received
     * @return the number of bytes received
     */
-    int32_t recv(int id, void *data, uint32_t amount);
+    int32_t recv_tcp(int id, void *data, uint32_t amount);
+
+    /**
+    * Receives datagram from an open UDP socket
+    *
+    * @param id id to receive from
+    * @param data placeholder for returned information
+    * @param amount number of bytes to be received
+    * @return the number of bytes received
+    */
+    int32_t recv_udp(int id, void *data, uint32_t amount);
 
     /**
     * Closes a socket
@@ -231,12 +243,21 @@ private:
     mbed::UARTSerial _serial;
     mbed::ATCmdParser _parser;
 
+    PinName _rts;
+    PinName _cts;
+
     struct packet {
         struct packet *next;
         int id;
         uint32_t len;
         // data follows
         char *data;
+		packet( int new_id, uint32_t new_len): next(NULL), id(new_id), len(new_len) {
+            this->data = new char[this->len];
+        }
+        ~packet() {
+            delete this->data;
+        }
     } *_packets, **_packets_end;
     void _packet_handler();
     //void _socket_close_handler();
