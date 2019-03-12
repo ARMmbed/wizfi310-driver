@@ -398,13 +398,12 @@ private:
     bool recv_state_update(char *buf, uint32_t len);
 
     /**
-     * Writes the command to the serial port.
-     * This also traces the command sent.
+     * Traces the command.
      *
      * @param fmt   format for the command.
      * @param ...   variadic arguments used with vprintf.
      */
-    void process_cmd(const char *fmt, ...);
+    void trace_cmd(const char *fmt, ...);
 
     void heart_beat();
     void end_action();

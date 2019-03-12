@@ -87,6 +87,8 @@
 #define AT_CMD_PARSER_INIT_TIMEOUT       1000
 #define AT_CMD_PARSER_RECV_TIMEOUT      20000
 
+#define send_command(...) { trace_cmd(__VA_ARGS__); m_serial.printf(__VA_ARGS__); }
+
 using namespace mbed;
 
 // =================================================================================================
@@ -214,7 +216,7 @@ nsapi_error_t WizFi310::disconnect()
     }
 
     m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::leave_done);
-    this->process_cmd("AT+WLEAVE\r");
+    send_command("AT+WLEAVE\r");
     return NSAPI_ERROR_IN_PROGRESS;
 }
 
@@ -245,11 +247,11 @@ int WizFi310::open(const char *type, const char *addr, int port, Callback<void(v
 
         m_cmd_ctx.sopen.s = s;
         m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::sopen_done);
-        this->process_cmd("AT+SCON=O,%s,%s,%d,,0\r", type, addr, port);
+        send_command("AT+SCON=O,%s,%s,%d,,0\r", type, addr, port);
         // TODO: shall we setup a time out there ?
         tr_info("expecting connect on: %d", id);
     } else {
-        core_util_atomic_store_u32(&m_active_action, ActionNone);
+        end_action();
         id = -1;
     }
     return id;
@@ -271,7 +273,7 @@ nsapi_error_t WizFi310::send(int id, const void *data, uint32_t amount)
     socket_t *s = &m_sockets[id];
 
     if (s->status != socket_t::StatusConnected) {
-        core_util_atomic_store_u32(&m_active_action, ActionNone);
+        end_action();
         return NSAPI_ERROR_NO_CONNECTION;
     }
 
@@ -280,7 +282,7 @@ nsapi_error_t WizFi310::send(int id, const void *data, uint32_t amount)
     m_cmd_ctx.ssend.amount = amount;
     m_cmd_ctx.ssend.did_send = false;
     m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::ssend_done);
-    this->process_cmd("AT+SSEND=%d,,,%lu\r", id, amount);
+    send_command("AT+SSEND=%d,,,%lu\r", id, amount);
     return NSAPI_ERROR_IN_PROGRESS;
 }
 
@@ -374,7 +376,7 @@ void WizFi310::serial_isr()
 
 void WizFi310::fatal_error(const char *msg)
 {
-    core_util_atomic_store_u32(&m_active_action, ActionBlocked);
+    m_active_action = ActionBlocked;
 
     m_serial.attach(NULL);
     m_attached = false;
@@ -667,8 +669,8 @@ bool WizFi310::recv_state_update(char *buf, uint32_t len)
                 s->mutex.lock();
                 if (s->status != socket_t::StatusConnecting) {
                     tr_warn("Unexpected connection on socket %d", id);
-                } else if (core_util_atomic_load_u32(&m_active_action) == ActionDoSOpen) {
-                    core_util_atomic_store_u32(&m_active_action, ActionNone);
+                } else if (m_active_action == ActionDoSOpen) {
+                    end_action();
                 }
                 s->status = socket_t::StatusConnected;
                 socket_event_data_t data;
@@ -676,7 +678,7 @@ bool WizFi310::recv_state_update(char *buf, uint32_t len)
                 s->mutex.unlock();
             } else if (this->parse_disconnect(buf, len, id)) {
                 socket_t *s = &m_sockets[id];
-                uint32_t act = core_util_atomic_load_u32(&m_active_action);
+                uint32_t act = m_active_action;
 
                 s->mutex.lock();
                 if (s->status == socket_t::StatusDisconnected) {
@@ -684,11 +686,11 @@ bool WizFi310::recv_state_update(char *buf, uint32_t len)
                 } else {
                     // tr_debug("act: %s s->status: %s", action2str((action_t)act), socket_t::status2str(s->status));
                     if ((act == ActionDoSOpen) && (s->status == socket_t::StatusConnecting)) {
-                        core_util_atomic_store_u32(&m_active_action, ActionNone);
+                        end_action();
                     } else {
                         if ((act == ActionDoSClose) && (id == m_cmd_ctx.sclose.id)) {
                             if (m_cmd_ctx.sclose.done) {
-                                core_util_atomic_store_u32(&m_active_action, ActionNone);
+                                end_action();
                             } else {
                                 m_cmd_ctx.sclose.id = -1;
                             }
@@ -700,8 +702,7 @@ bool WizFi310::recv_state_update(char *buf, uint32_t len)
                     socket_event_data_t data;
                     s->notify(EventDisconnected, data);
                 }
-                act = core_util_atomic_load_u32(&m_active_action);
-                // tr_debug("act: %s s->status: %s", action2str((action_t)act), socket_t::status2str(s->status));
+                // tr_debug("act: %s s->status: %s", action2str((action_t)m_active_action), socket_t::status2str(s->status));
                 s->mutex.unlock();
             } else if (this->parse_send_rdy(buf, len, id, plen)) {
                 MBED_ASSERT(m_active_action == ActionDoSSend);
@@ -727,7 +728,7 @@ bool WizFi310::recv_state_update(char *buf, uint32_t len)
     return false;
 }
 
-void WizFi310::process_cmd(const char *cmd, ...)
+void WizFi310::trace_cmd(const char *cmd, ...)
 {
     va_list args;
     va_start(args, cmd);
@@ -737,13 +738,12 @@ void WizFi310::process_cmd(const char *cmd, ...)
         tr_info("%s|%s: sending: %.*s", recv_state2str(m_recv_state), action2str((action_t)m_active_action), len, output);
         (void)len;
     }
-    m_serial.vprintf(cmd, args);
     va_end(args);
 }
 
 void WizFi310::end_action()
 {
-    core_util_atomic_store_u32(&m_active_action, ActionNone);
+    m_active_action = ActionNone;
 }
 
 // runs on the private event queue
@@ -793,7 +793,7 @@ void WizFi310::do_reset()
     m_serial.attach(Callback<void()>(this, &WizFi310::serial_isr));
 
     // this is a factory reset
-    this->process_cmd("AT+MFDEF=FR\r");
+    send_command("AT+MFDEF=FR\r");
 
     // TODO: setup a timeout ?
     m_greetings_cbk = Callback<void(const char[8])>(this, &WizFi310::do_echo_off);
@@ -805,7 +805,7 @@ void WizFi310::do_echo_off(const char fw_rev[8])
     m_greetings_cbk = NULL;
     memcpy(m_firmware_rev, fw_rev, 8);
     m_recv_state = Ready;
-    this->process_cmd("AT+MECHO=0\r");
+    send_command("AT+MECHO=0\r");
     m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::do_setup_serial);
 }
 
@@ -819,13 +819,13 @@ void WizFi310::do_setup_serial(cmd_resp_t rsp)
 
 #ifdef DEVICE_SERIAL_FC
     if (m_has_hwfc) {
-        this->process_cmd("AT+USET=115200,N,8,1,HW\r");
+        send_command("AT+USET=115200,N,8,1,HW\r");
     } else
 #endif
     {
         // this shall have no effect as other wise we would be reaching this point.
         // we may in the future want to use a higher speed.
-        this->process_cmd("AT+USET=115200,N,8,1,N\r");
+        send_command("AT+USET=115200,N,8,1,N\r");
     }
     m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::serial_setup_done);
 }
@@ -860,7 +860,7 @@ void WizFi310::device_ready(const char fw_rev[8])
 
 void WizFi310::do_set_access_point()
 {
-    this->process_cmd("AT+WSET=0,%s\r", m_cmd_ctx.connect.ap);
+    send_command("AT+WSET=0,%s\r", m_cmd_ctx.connect.ap);
     m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::do_set_password);
 }
 
@@ -875,9 +875,9 @@ void WizFi310::do_set_password(cmd_resp_t rsp)
     }
 
     if (strcmp(m_cmd_ctx.connect.sec, "OPEN") == 0) {
-        this->process_cmd("AT+WSEC=0,,12345678\r");
+        send_command("AT+WSEC=0,,12345678\r");
     } else {
-        this->process_cmd("AT+WSEC=0,,%s\r", m_cmd_ctx.connect.pw);
+        send_command("AT+WSEC=0,,%s\r", m_cmd_ctx.connect.pw);
     }
     m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::do_set_dhcp);
 }
@@ -893,10 +893,10 @@ void WizFi310::do_set_dhcp(cmd_resp_t rsp)
     }
 
     if (m_dhcp) {
-        this->process_cmd("AT+WNET=1\r");
+        send_command("AT+WNET=1\r");
     } else {
         // we need to have a way to set these
-        this->process_cmd("AT+WNET=0,%s,%s,%s\r", m_ip_buffer, m_netmask_buffer, m_gateway_buffer);
+        send_command("AT+WNET=0,%s,%s,%s\r", m_ip_buffer, m_netmask_buffer, m_gateway_buffer);
     }
     m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::do_join);
 }
@@ -911,7 +911,7 @@ void WizFi310::do_join(cmd_resp_t rsp)
         this->end_action();
         return;
     }
-    this->process_cmd("AT+WJOIN\r");
+    send_command("AT+WJOIN\r");
     m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::join_done);
 }
 
@@ -930,7 +930,7 @@ void WizFi310::join_done(cmd_resp_t rsp)
 
 void WizFi310::do_scan()
 {
-    this->process_cmd("AT+WSCAN\r");
+    send_command("AT+WSCAN\r");
 }
 
 // runs from the event queue
@@ -950,7 +950,7 @@ void WizFi310::sopen_done(cmd_resp_t rsp)
 
     if (rsp != CmdRspOk) {
         MBED_ASSERT(m_active_action != ActionDoSSend);
-        core_util_atomic_store_u32(&m_active_action, ActionNone);
+        end_action();
         socket_event_data_t data;
         s->notify(EventDisconnected, data);
     }
@@ -988,7 +988,7 @@ void WizFi310::do_sclose(int id)
     }
     m_cmd_ctx.sclose.id = id;
     m_cmd_ctx.sclose.done = false;
-    this->process_cmd("AT+SMGMT=%d\r", id);
+    send_command("AT+SMGMT=%d\r", id);
     m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::sclose_done);
 }
 
@@ -997,11 +997,11 @@ void WizFi310::sclose_done(cmd_resp_t rsp)
     int id = m_cmd_ctx.sclose.id;
     if (rsp != CmdRspOk) {
         MBED_ASSERT(m_active_action != ActionDoSSend);
-        core_util_atomic_store_u32(&m_active_action, ActionNone);
+        end_action();
         m_event_queue.call(this, &WizFi310::do_sclose, id);
     } else if (id < 0) {
         MBED_ASSERT(m_active_action != ActionDoSSend);
-        core_util_atomic_store_u32(&m_active_action, ActionNone);
+        end_action();
     } else {
         m_cmd_ctx.sclose.done = true;
     }
