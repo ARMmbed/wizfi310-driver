@@ -103,12 +103,11 @@ static void consume(uint8_t *to, uint8_t *from, volatile uint32_t &from_len, uin
 WizFi310::WizFi310(PinName tx, PinName rx, PinName rts, PinName cts, PinName rst) :
     m_rst(rst), m_rts(rts), m_cts(cts), m_nrst_pin(rst, 0),
     m_serial(tx, rx, WIZFI310_DEFAULT_BAUD_RATE),
-    m_attached(false),
     m_has_hwfc((rts != NC) && (cts != NC)),
-    m_rx_event_id(0), m_isr_buf_len(0), m_line_buf_len(0),
+    m_rx_event_id(0), m_attached(false), m_isr_buf_len(0), m_line_buf_len(0),
     m_active_action(ActionBlocked),
-    m_greetings_cbk(NULL), m_on_cmd_end(NULL),
     m_recv_state(Unknown),
+    m_greetings_cbk(NULL), m_on_cmd_end(NULL),
     m_data_to_receive(0), m_pending_packet(NULL), m_pending_socket(NULL), m_heap_used(0),
     m_thread(osPriorityNormal, MBED_CONF_WIZFI310_STACKSIZE, NULL, "wizfi310_driver"),
     m_event_queue(MBED_CONF_WIZFI310_EVENT_QUEUE_SIZE),
@@ -400,7 +399,6 @@ void WizFi310::serial_event()
             // TODO: simplify/rationalize this, it is too complex to sit here
             // the ratio indentation/line count is 
             core_util_critical_section_enter();
-            bool buffer_was_full = m_isr_buf_len == MBED_CONF_WIZFI310_RX_BUFFER_SIZE;
             switch (m_recv_state) {
                 case ResetRequired:
                     break;
@@ -960,21 +958,19 @@ void WizFi310::sopen_done(cmd_resp_t rsp)
 
 void WizFi310::ssend_done(cmd_resp_t rsp)
 {
-    nsapi_error_t res = NSAPI_ERROR_OK;
-
-
-    if (rsp == CmdRspErrorInvalidInput) {
-        res = NSAPI_ERROR_PARAMETER;
-    } else if (rsp != CmdRspOk) {
-        MBED_ASSERT(m_cmd_ctx.ssend.did_send);
-        res = NSAPI_ERROR_DEVICE_ERROR;
-    }
-    socket_t *s = m_cmd_ctx.ssend.s;
-    uint32_t sent = m_cmd_ctx.ssend.amount;
-    this->end_action();
-
     socket_event_data_t data;
-    data.data_sent.amount_or_error = sent;
+    socket_t *s = m_cmd_ctx.ssend.s;
+    if (rsp == CmdRspErrorInvalidInput) {
+        data.data_sent.amount_or_error = NSAPI_ERROR_PARAMETER;
+    } else if (rsp != CmdRspOk) {
+        data.data_sent.amount_or_error = NSAPI_ERROR_DEVICE_ERROR;
+    } else {
+        MBED_ASSERT(m_cmd_ctx.ssend.did_send);
+        uint32_t sent = m_cmd_ctx.ssend.amount;
+        this->end_action();
+
+        data.data_sent.amount_or_error = sent;
+    }
     s->notify(EventDataSent, data);
 }
 

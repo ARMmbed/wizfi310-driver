@@ -404,8 +404,10 @@ int WizFi310Interface::socket_recv(void *handle, void *data, unsigned size)
     if (s->first != NULL) {
         p = s->first;
 
+        uint32_t plen = p->len();
         read = p->consume((char *)data, size);
-        tr_debug("%d: f: %p l: %p; read: %lu/%lu", __LINE__, s->first, s->last, read, p->len());
+        tr_debug("%d: f: %p l: %p; read: %lu/%lu", __LINE__, s->first, s->last, read, plen);
+        (void)plen;
         if (p->len() == 0) {
             s->first = p->next();
             if (s->first == NULL) {
@@ -422,7 +424,7 @@ int WizFi310Interface::socket_recv(void *handle, void *data, unsigned size)
         read = 0;
     }
     s->state_mtx.unlock();
-    tr_debug("socket_recv(%p, %p, %lu)=%ld", s, data, size, read);
+    tr_debug("socket_recv(%p, %p, %u)=%ld", s, data, size, read);
     return read;
 }
 
@@ -529,11 +531,9 @@ void WizFi310Interface::socket_event(void *ctx, WizFi310::socket_event_t type, W
         }
     }
     if (s->cbk) {
-        tr_debug("socket_event(%p, %d): callback", data, type);
         s->cbk(s->data);
     }
     s->state_mtx.unlock();
-    tr_debug("socket_event(%p, %d): done", data, type);
 }
 
 void WizFi310Interface::wizfi310_socket::close()
