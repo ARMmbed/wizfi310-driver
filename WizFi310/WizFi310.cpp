@@ -96,8 +96,6 @@ bool WizFi310::startup(int mode)
 	_parser.oob("{", callback(this, &WizFi310::_packet_handler));
 	
 #if !DEVICE_SERIAL_FC
-	_serial.set_flow_control(SerialBase::Disabled);
-
     if( _parser.send("AT+USET=%d,N,8,1,N",WIZFI310_DEFAULT_BAUD_RATE)
         && _parser.recv("[OK]")
         && _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version) )
@@ -105,10 +103,10 @@ bool WizFi310::startup(int mode)
         //debug_if(_dbg_on, "error disabling HW flow control\r\n");
         return false;
     }
+	_serial.set_flow_control(SerialBase::Disabled);
 #else
     if( (_rts != NC) && (_cts != NC) )
     {
-    	_serial.set_flow_control(SerialBase::RTSCTS, _rts, _cts);
         if( _parser.send("AT+USET=%d,N,8,1,HW",WIZFI310_DEFAULT_BAUD_RATE)
             && _parser.recv("[OK]")
             && _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version) )
@@ -116,10 +114,10 @@ bool WizFi310::startup(int mode)
             //debug_if(_dbg_on, "error enabling HW flow control\r\n");
             return false;
         }
+		_serial.set_flow_control(SerialBase::RTSCTS, _rts, _cts);
     }
     else
     {
-    	_serial.set_flow_control(SerialBase::Disabled);
         if( _parser.send("AT+USET=%d,N,8,1,N",WIZFI310_DEFAULT_BAUD_RATE)
             && _parser.recv("[OK]")
             && _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version) )
@@ -127,6 +125,7 @@ bool WizFi310::startup(int mode)
             //debug_if(_dbg_on, "error disabling HW flow control\r\n");
             return false;
         }
+		_serial.set_flow_control(SerialBase::Disabled);
     }
 #endif //DEVICE_SERIAL_FC
 
