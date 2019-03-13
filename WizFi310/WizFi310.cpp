@@ -360,9 +360,14 @@ void WizFi310::serial_isr()
         m_attached = false;
         return;
     }
-    int input = m_serial.getc();
+    int input = -1;
+    // .getc() contains a loop on readable. we don't want to get stuck in it from an interrupt.
+    if (m_serial.readable()) {
+        input = m_serial.getc();
+    }
     if (input < 0) {
         // TODO: do we want to catch that ?
+        // Most probably yes.
         return;
     }
 
