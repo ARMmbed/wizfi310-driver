@@ -27,7 +27,7 @@ using namespace utest::v1;
 template <int COUNT>
 void test_bring_up_down() {
     WizFi310Interface net(MBED_CFG_WIZFI310_TX, MBED_CFG_WIZFI310_RX, MBED_CFG_WIZFI310_DEBUG);
-    net.set_credentials(STRINGIZEWIZFI310_SSID), STRINGIZE(MBED_CFG_WIZFI310_PASS));
+    int err = net.connect(STRINGIZE(MBED_CFG_WIZFI310_SSID), STRINGIZE(MBED_CFG_WIZFI310_PASS));
 
     for (int i = 0; i < COUNT; i++) {
         int err = net.connect();

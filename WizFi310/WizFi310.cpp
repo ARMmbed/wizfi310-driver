@@ -41,8 +41,9 @@
 #define AT_CMD_PARSER_RECV_TIMEOUT      20000
 
 using namespace mbed;
-WizFi310::WizFi310(PinName tx, PinName rx, bool debug)
+WizFi310::WizFi310(PinName tx, PinName rx, PinName rts, PinName cts, bool debug)
     : _serial(tx, rx, WIZFI310_DEFAULT_BAUD_RATE),
+      _rts(rts), _cts(cts),
       _parser(&_serial),
       _packets(0),
       _packets_end(&_packets)
@@ -51,7 +52,6 @@ WizFi310::WizFi310(PinName tx, PinName rx, bool debug)
     _parser.debug_on(debug);
     _parser.set_delimiter("\r\n");
 
-    setTimeout(AT_CMD_PARSER_INIT_TIMEOUT);
     for(int i=0; i<10; i++)
     {
         if( _parser.send("AT") && _parser.recv("[OK]") )
@@ -86,15 +86,50 @@ const char* WizFi310::get_firmware_version()
 }
 
 bool WizFi310::startup(int mode)
-{
+{	
     if( mode != 0 && mode != 1 )
     {
         return false;
     }
     _op_mode = mode;
 
-    _parser.oob("{", callback(this, &WizFi310::_packet_handler));
-    //_parser.oob("\n{", callback(this, &WizFi310::_packet_handler));
+	_parser.oob("{", callback(this, &WizFi310::_packet_handler));
+	
+#if !DEVICE_SERIAL_FC
+	_serial.set_flow_control(SerialBase::Disabled);
+
+    if( _parser.send("AT+USET=%d,N,8,1,N",WIZFI310_DEFAULT_BAUD_RATE)
+        && _parser.recv("[OK]")
+        && _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version) )
+    {
+        //debug_if(_dbg_on, "error disabling HW flow control\r\n");
+        return false;
+    }
+#else
+    if( (_rts != NC) && (_cts != NC) )
+    {
+    	_serial.set_flow_control(SerialBase::RTSCTS, _rts, _cts);
+        if( _parser.send("AT+USET=%d,N,8,1,HW",WIZFI310_DEFAULT_BAUD_RATE)
+            && _parser.recv("[OK]")
+            && _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version) )
+        {
+            //debug_if(_dbg_on, "error enabling HW flow control\r\n");
+            return false;
+        }
+    }
+    else
+    {
+    	_serial.set_flow_control(SerialBase::Disabled);
+        if( _parser.send("AT+USET=%d,N,8,1,N",WIZFI310_DEFAULT_BAUD_RATE)
+            && _parser.recv("[OK]")
+            && _parser.recv("WizFi310 Version %s (WIZnet Co.Ltd)", _firmware_version) )
+        {
+            //debug_if(_dbg_on, "error disabling HW flow control\r\n");
+            return false;
+        }
+    }
+#endif //DEVICE_SERIAL_FC
+
     return true;
 }
 
@@ -321,40 +356,65 @@ void WizFi310::_packet_handler()
     _packets_end = &packet->next;
 }
 
-int32_t WizFi310::recv(int id, void *data, uint32_t amount)
+int32_t WizFi310::recv_tcp(int id, void *data, uint32_t amount)
 {
-	while (true) {
-		// check if any packets are ready for us
-        for (struct packet **p = &_packets; *p; p = &(*p)->next) {
-            if ((*p)->id == id) {
-                struct packet *q = *p;
-                
-                if (q->len <= amount) {
-                    memcpy(data,q->data, q->len);
+    while(_parser.process_oob()) {
+    }
 
-                    if (_packets_end == &(*p)->next) {
-                        _packets_end = p;
-                    }
-                    *p = (*p)->next;
+    for (struct packet **p = &_packets; *p; p = &(*p)->next) {
+        if ((*p)->id == id) {
+            struct packet *q = *p;
 
-                    uint32_t len = q->len;
-                    free(q);
-                    return len;
-                } else { // return only partial packet
-                    memcpy(data, q->data, amount);
-                    
-                    q->len -= amount;
-                    memmove(q->data, (uint8_t*)(q->data) + amount, q->len);
-                    return amount;
+            if (q->len <= amount) {
+                memcpy(data,q->data, q->len);
+
+                if (_packets_end == &(*p)->next) {
+                    _packets_end = p;
                 }
+                *p = (*p)->next;
+
+                uint32_t len = q->len;
+                delete(q);
+                return len;
+            } else { // return only partial packet
+                memcpy(data, q->data, amount);
+
+                q->len -= amount;
+                memmove(q->data, (uint8_t*)(q->data) + amount, q->len);
+                return amount;
             }
         }
+    }
 
-        // check for inbound packets
-        if (!_parser.process_oob()) {
-            return -1;
+    return NSAPI_ERROR_WOULD_BLOCK;
+}
+
+int32_t WizFi310::recv_udp(int id, void *data, uint32_t amount)
+{
+    // Poll for inbound packets
+    while (_parser.process_oob()) {
+    }
+
+    // check if any packets are ready for us
+    for (struct packet **p = &_packets; *p; p = &(*p)->next) {
+        if ((*p)->id == id) {
+            struct packet *q = *p;
+
+            // Return and remove packet (truncated if necessary)
+            uint32_t len = q->len < amount ? q->len : amount;
+            memcpy(data, q->data, len);
+
+            if (_packets_end == &(*p)->next) {
+                _packets_end = p;
+            }
+            *p = (*p)->next;
+
+            delete(q);
+            return len;
         }
     }
+
+    return NSAPI_ERROR_WOULD_BLOCK;
 }
 
 bool WizFi310::close(int id)

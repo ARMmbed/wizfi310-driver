@@ -51,9 +51,11 @@ public:
     /* WizFi310Interface constructor
      */
 
-    WizFi310Interface(PinName tx = MBED_CONF_WIZFI310_TX,
-                      PinName rx = MBED_CONF_WIZFI310_RX,
-                      bool debug = MBED_CONF_WIZFI310_DEBUG);
+    WizFi310Interface(PinName tx  = MBED_CONF_WIZFI310_TX,
+                      PinName rx  = MBED_CONF_WIZFI310_RX,
+                      bool debug = MBED_CONF_WIZFI310_DEBUG,
+                      PinName rts = MBED_CONF_WIZFI310_RTS,
+                      PinName cts = MBED_CONF_WIZFI310_CTS );
 
     /** Start the interface
      *

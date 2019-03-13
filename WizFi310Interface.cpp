@@ -67,8 +67,8 @@ using namespace mbed;
 #endif
 
 // WizFi310Interface implementation
-WizFi310Interface::WizFi310Interface(PinName tx, PinName rx, bool debug)
-    : _wizfi310(tx, rx, debug)
+WizFi310Interface::WizFi310Interface(PinName tx, PinName rx, bool debug, PinName rts, PinName cts)
+    : _wizfi310(tx, rx, rts, cts, debug)
 {
     memset(_ids, 0, sizeof(_ids));
     memset(_cbs, 0, sizeof(_cbs));
@@ -326,9 +326,15 @@ int WizFi310Interface::socket_recv(void *handle, void *data, unsigned size)
     struct wizfi310_socket *socket = (struct wizfi310_socket *)handle;
     _wizfi310.setTimeout(WIZFI310_RECV_TIMEOUT);
 
-    int32_t recv = _wizfi310.recv(socket->id, data, size);
-    if (recv < 0) {
-        return NSAPI_ERROR_WOULD_BLOCK;
+    int32_t recv;
+    if (socket->proto == NSAPI_TCP) {
+    	recv = _wizfi310.recv_tcp(socket->id, data, size);
+    	if (recv <= 0 && recv != NSAPI_ERROR_WOULD_BLOCK) {
+    		socket->connected = false;
+    	}
+    }
+    else {
+    	recv = _wizfi310.recv_udp(socket->id, data, size);
     }
 
     return recv;
@@ -360,6 +366,11 @@ int WizFi310Interface::socket_sendto(void *handle, const SocketAddress &addr, co
 int WizFi310Interface::socket_recvfrom(void *handle, SocketAddress *addr, void *data, unsigned size)
 {
     struct wizfi310_socket *socket = (struct wizfi310_socket *)handle;
+
+    if (!socket) {
+    	return NSAPI_ERROR_NO_SOCKET;
+    }
+
     int ret = socket_recv(socket, data, size);
     if (ret >= 0 && addr) {
         *addr = socket->addr;
