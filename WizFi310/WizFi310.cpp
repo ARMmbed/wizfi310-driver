@@ -827,9 +827,11 @@ void WizFi310::do_setup_serial(cmd_resp_t rsp)
         // we may in the future want to use a higher speed.
         send_command("AT+USET=115200,N,8,1,N\r");
     }
-    m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::serial_setup_done);
+    // m_on_cmd_end = Callback<void(cmd_resp_t)>(this, &WizFi310::serial_setup_done);
+    m_greetings_cbk = Callback<void(const char[8])>(this, &WizFi310::device_ready);
 }
 
+/*
 void WizFi310::serial_setup_done(cmd_resp_t rsp)
 {
     if (rsp != CmdRspOk) {
@@ -839,14 +841,15 @@ void WizFi310::serial_setup_done(cmd_resp_t rsp)
     }
     if (m_has_hwfc) {
         tr_debug("enabling flow control");
-        m_serial.set_flow_control(SerialBase::RTSCTS, m_rts, m_cts);
     }
     m_greetings_cbk = Callback<void(const char[8])>(this, &WizFi310::device_ready);
 }
+*/
 
 void WizFi310::device_ready(const char fw_rev[8])
 {
     (void)fw_rev; // not used here.
+    m_serial.set_flow_control(SerialBase::RTSCTS, m_rts, m_cts);
     m_greetings_cbk = NULL;
 
     if (m_active_action == ActionDoConnect) {
