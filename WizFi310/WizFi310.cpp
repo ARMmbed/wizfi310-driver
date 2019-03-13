@@ -790,8 +790,11 @@ void WizFi310::do_reset()
         wait_ms(250);
         m_nrst_pin = 1;
         wait_ms(500);
+
         // flushes the serial port
-        while (m_serial.getc() != -1);
+        while (m_serial.readable() > 0) {
+            m_serial.getc();
+        }
     }
 
     m_attached = true;
