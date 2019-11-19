@@ -857,7 +857,9 @@ void WizFi310::serial_setup_done(cmd_resp_t rsp)
 void WizFi310::device_ready(const char fw_rev[8])
 {
     (void)fw_rev; // not used here.
-    m_serial.set_flow_control(SerialBase::RTSCTS, m_rts, m_cts);
+    if (m_has_hwfc) {
+        m_serial.set_flow_control(SerialBase::RTSCTS, m_rts, m_cts);
+    }
     m_greetings_cbk = NULL;
 
     if (m_active_action == ActionDoConnect) {
