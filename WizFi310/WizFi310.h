@@ -82,7 +82,7 @@ public:
      * @param cts   Cts pin name.
      * @param rst   Rst pin name.
      */
-    WizFi310(PinName tx, PinName rx, PinName rtx = NC, PinName cts = NC, PinName rst = NC);
+    WizFi310(PinName tx, PinName rx, PinName rts = NC, PinName cts = NC, PinName rst = NC);
     ~WizFi310();
 
     /**
